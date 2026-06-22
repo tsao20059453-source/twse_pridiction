@@ -1,0 +1,46 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Data / cache / output
+data/raw/
+data/processed/
+output/
+models/
+*.joblib
+*.pkl
+*.csv
+*.xlsx
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude / AI tool cache
+.claude/
+
+# Runtime logs and test outputs
+*.txt
+*_err.txt
+test_*.txt
+pipe_*.txt
+
+# Documents and reports
+*.pdf
+*.docx
+
+# Streamlit cache
+.streamlit/secrets.toml
+
