@@ -441,6 +441,7 @@ def run_backtest(
     df: pd.DataFrame,
     config: PipelineConfig,
     mode: str = "single",
+    investor_mode: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Backward-compatible wrapper around run_portfolio_backtest().
@@ -468,6 +469,8 @@ def run_backtest(
         config=config,
         market_df=None,
         expected_symbols=list(all_stock_signals.keys()),
+        investor_mode=investor_mode,
+        save_snapshot=False,
     )
     return trade_log_df, equity_curve
 
@@ -924,6 +927,8 @@ def run_portfolio_backtest(
     config: PipelineConfig,
     market_df: Optional[pd.DataFrame] = None,
     expected_symbols: Optional[list[str]] = None,
+    investor_mode: bool = False,
+    save_snapshot: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
     Portfolio 層級回測：所有股票共用同一筆資金池與最大持倉數限制，
@@ -943,12 +948,13 @@ def run_portfolio_backtest(
     """
     # ── 股票池組成驗證 ───────────────────────────────────────────────
     pool_symbols = sorted(str(s) for s in (all_stock_signals or {}).keys())
-    print(f"回測股票池：{pool_symbols}")
-    print(f"股票數量：{len(pool_symbols)}")
+    if not investor_mode:
+        print(f"回測股票池：{pool_symbols}")
+        print(f"股票數量：{len(pool_symbols)}")
     if expected_symbols is not None:
         expected_set = {str(s) for s in expected_symbols}
         unexpected_symbols = sorted(s for s in pool_symbols if s not in expected_set)
-        if unexpected_symbols:
+        if unexpected_symbols and not investor_mode:
             print(f"WARNING：以下股票不在 Top N 清單中：{unexpected_symbols}")
 
     initial_capital = config.backtest_initial_capital
@@ -1893,13 +1899,13 @@ def run_portfolio_backtest(
                         _profit_ts = (today_close - _avg_ep_ts) / _avg_ep_ts
                     else:
                         _profit_ts = 0.0
-                    if _profit_ts < 0.15:
-                        # 階段一：寬鬆緩衝，避免正常波動洗出
+                    if _profit_ts < 0.20:
+                        # 階段一：寬鬆緩衝，避免正常波動洗出（門檻 0.20）
                         trailing_price = pos["max_close"] - 2.0 * _atr_val
                         pos["trailing_method"] = "atr_stage1_wide"
                         pos["trailing_stage"] = 1
                     elif _profit_ts >= 0.20 and _trend_still_strong(row, today_close):
-                        # 階段二（含）以上：原本 ma20_atr_relaxed 邏輯
+                        # 階段二-A：趨勢仍強，使用 ma20_atr_relaxed
                         trailing_price = pos["max_close"] - pos["trailing_multiplier"] * _atr_val
                         wider_atr_stop = pos["max_close"] - max(pos["trailing_multiplier"] + 1.0, 4.0) * _atr_val
                         trend_stops = [wider_atr_stop]
@@ -1909,19 +1915,16 @@ def run_portfolio_backtest(
                         pos["trailing_method"] = "ma20_atr_relaxed"
                         pos["trailing_stage"] = 2
                     elif _profit_ts >= 0.30:
+                        # 階段二-B：趨勢非強，獲利 >= 30%，floor = entry × 1.15
                         trailing_price = pos["max_close"] - pos["trailing_multiplier"] * _atr_val
                         trailing_price = max(trailing_price, _avg_ep_ts * 1.15)
                         pos["trailing_method"] = "atr_profit_floor"
                         pos["trailing_stage"] = 2
-                    elif _profit_ts >= 0.20:
+                    else:
+                        # 階段二-C：趨勢非強，20% <= profit < 30%，floor = entry × 1.10
                         trailing_price = pos["max_close"] - pos["trailing_multiplier"] * _atr_val
                         trailing_price = max(trailing_price, _avg_ep_ts * 1.10)
                         pos["trailing_method"] = "atr_profit_floor"
-                        pos["trailing_stage"] = 2
-                    else:
-                        # 0.15 <= profit < 0.20：階段二，原邏輯
-                        trailing_price = pos["max_close"] - pos["trailing_multiplier"] * _atr_val
-                        pos["trailing_method"] = "atr"
                         pos["trailing_stage"] = 2
                     pos["stop_loss"] = max(pos["stop_loss"], trailing_price)
                     pos["trailing_stop_activated"] = True
@@ -2677,6 +2680,34 @@ def run_portfolio_backtest(
     metrics["entry_primary_rejection_counts"] = dict(entry_primary_rejection_counts)
     metrics["primary_rejection_reason"] = dict(entry_primary_rejection_counts)
     metrics["entry_diagnostics_daily"] = pd.DataFrame(entry_diagnostics_daily_rows)
+
+    # ── 持倉快照（回測結束時仍未平倉的持倉）─────────────────────────
+    if save_snapshot and positions:
+        from pathlib import Path
+        _cv = getattr(config, "backtest_profile_name",
+                      getattr(config, "backtest_portfolio_config_version", "portfolio"))
+        _ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        _rows = []
+        for pos in positions:
+            _ep = pos.get("avg_entry_price", pos.get("entry_price", np.nan))
+            _mc = pos.get("max_close", np.nan)
+            _upct = (_mc - _ep) / _ep if (pd.notna(_ep) and _ep > 0 and pd.notna(_mc)) else np.nan
+            _rows.append({
+                "symbol":          pos.get("symbol"),
+                "entry_date":      pos.get("entry_date"),
+                "avg_entry_price": _ep,
+                "max_close":       _mc,
+                "unrealized_pct":  _upct,
+                "holding_days":    pos.get("holding_days", 0),
+                "stop_loss":       pos.get("stop_loss"),
+                "trailing_method": pos.get("trailing_method", "none"),
+                "trailing_stage":  pos.get("trailing_stage", 0),
+            })
+        _snap_dir = Path(getattr(config, "output_dir", "output"))
+        _snap_dir.mkdir(exist_ok=True)
+        _holdings_path = _snap_dir / f"current_holdings_{_cv}_{_ts}.csv"
+        pd.DataFrame(_rows).to_csv(_holdings_path, index=False, encoding="utf-8-sig")
+        print(f"持倉快照已輸出：{_holdings_path}")
 
     return equity_curve, trade_log_df, metrics
 

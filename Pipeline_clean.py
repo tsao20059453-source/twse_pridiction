@@ -277,6 +277,12 @@ def main() -> None:
         help="target_compare 時跳過 classification，只跑 regression / ranking",
     )
     parser.add_argument("--sensitivity-profiles", default=None)
+    parser.add_argument(
+        "--investor-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="只輸出投資人摘要；--no-investor-mode 強制顯示完整診斷",
+    )
     args, _ = parser.parse_known_args()
 
     direct_run = len(sys.argv) == 1
@@ -482,11 +488,12 @@ def main() -> None:
             target_symbol=backtest_symbol,
             mode=bt_mode,
             run_profile_experiments=args.run_profile_experiments,
+            investor_mode=args.investor_mode or False,
         )
         return
 
     if args.mode == "single_diagnostic":
-        run_single_stock_diagnostic(config, top_n=top_n or 30)
+        run_single_stock_diagnostic(config, top_n=top_n or 30, investor_mode=True if args.investor_mode is None else args.investor_mode)
         return
 
     if args.mode == "dual_diagnostic":
@@ -538,7 +545,7 @@ def main() -> None:
         else:
             if args.mode == "train":
                 print("使用模式：train")
-            run_common_model_train(config, top_n=top_n or 30, symbols_override=symbols_for_training)
+            run_common_model_train(config, top_n=top_n or 30, symbols_override=symbols_for_training, investor_mode=True if args.investor_mode is None else args.investor_mode)
     else:
         run_pipeline(config)
 

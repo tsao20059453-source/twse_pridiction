@@ -331,22 +331,23 @@ def print_presentation_data_summary(
     print()
 
 
-def print_presentation_model_settings(config: PipelineConfig, top_n: Optional[int] = None) -> None:
+def print_presentation_model_settings(config: PipelineConfig, top_n: Optional[int] = None, investor_mode: bool = True) -> None:
     importance_enabled = bool(ENABLE_IMPORTANCE_FEATURE_SELECTION and config.run_feature_importance)
     print("=" * 70)
     print("本次模型設定")
     print("=" * 70)
     print()
-    print(f"target_col：{config.target_col}")
-    print(f"feature_set：{config.feature_set}")
-    print(f"model_type：{config.model_type}")
-    print(f"model_profile：{config.model_profile}")
-    print(f"diagnostic_scope：{config.diagnostic_scope}")
-    print(f"top_n：{format_report_count(top_n)}")
-    print(f"display_mode：{config.display_mode}")
-    print(f"importance_based_feature_removal：{importance_enabled}")
-    print(f"run_feature_importance：{config.run_feature_importance}")
-    print()
+    if not investor_mode:
+        print(f"target_col：{config.target_col}")
+        print(f"feature_set：{config.feature_set}")
+        print(f"model_type：{config.model_type}")
+        print(f"model_profile：{config.model_profile}")
+        print(f"diagnostic_scope：{config.diagnostic_scope}")
+        print(f"top_n：{format_report_count(top_n)}")
+        print(f"display_mode：{config.display_mode}")
+        print(f"importance_based_feature_removal：{importance_enabled}")
+        print(f"run_feature_importance：{config.run_feature_importance}")
+        print()
     print("目前主模型 target：")
     if config.target_col == "target_safety_10d_cs_rank":
         print("- target_safety_10d_cs_rank：安全 / 下行風險優先的 10 日橫斷面相對分數")
@@ -1301,7 +1302,7 @@ def get_single_diagnostic_model_confidence_note(row: pd.Series) -> str:
     return "模型分數可作為輔助參考"
 
 
-def run_single_stock_diagnostic(config: PipelineConfig, top_n: int = 30) -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_single_stock_diagnostic(config: PipelineConfig, top_n: int = 30, investor_mode: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     if config.stock_no.strip().upper() in {"ALL", "*", "全部"}:
         raise ValueError("single_diagnostic 需要指定單一股票代碼，例如 --symbol 2330")
     verbose = config.display_mode == "research"
@@ -1318,7 +1319,7 @@ def run_single_stock_diagnostic(config: PipelineConfig, top_n: int = 30) -> tupl
         print(f"model_profile={config.model_profile}")
         print(f"target_col={config.target_col}")
 
-    return run_shared_single_stock_diagnostic(config, top_n=top_n, verbose=verbose)
+    return run_shared_single_stock_diagnostic(config, top_n=top_n, verbose=verbose, investor_mode=investor_mode)
 
     if verbose:
         data = prepare_common_single_diagnostic_feature_data(config, top_n=top_n)
@@ -4149,10 +4150,14 @@ def run_shared_single_stock_diagnostic(
     config: PipelineConfig,
     top_n: int = 30,
     verbose: bool = False,
+    investor_mode: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     target_symbol = str(config.stock_no).strip()
     if not verbose:
-        print_presentation_process_header()
+        if investor_mode:
+            print("正在分析個股資料...")
+        else:
+            print_presentation_process_header()
 
     stock_list, symbols = build_shared_common_stock_pool(
         base_config=config,
@@ -4258,8 +4263,9 @@ def run_shared_single_stock_diagnostic(
         )
         print_final_investment_decision(output_df, shared_config, summary=summary)
         print_shared_common_validation_metrics(shared_result)
-        print_presentation_model_settings(shared_config, top_n=len(symbols))
-        print_presentation_feature_fold_appendix(shared_config, metrics=shared_result["safety_metrics"])
+        print_presentation_model_settings(shared_config, top_n=len(symbols), investor_mode=investor_mode)
+        if not investor_mode:
+            print_presentation_feature_fold_appendix(shared_config, metrics=shared_result["safety_metrics"])
         print("Output files:")
         print(f"1. {csv_path}")
         print(f"2. {xlsx_path}")
@@ -4705,10 +4711,14 @@ def run_common_model_train(
     base_config: PipelineConfig,
     top_n: int = 30,
     symbols_override: list[str] | None = None,
+    investor_mode: bool = True,
 ) -> pd.DataFrame:
     presentation = base_config.display_mode == "presentation"
     if presentation:
-        print_presentation_process_header()
+        if investor_mode:
+            print("正在分析市場資料...")
+        else:
+            print_presentation_process_header()
     stock_list, symbols = build_shared_common_stock_pool(
         base_config=base_config,
         top_n=top_n,
@@ -4765,8 +4775,9 @@ def run_common_model_train(
         print()
         print_presentation_model_validation_summary(metrics, is_multi_stock=True)
         print_shared_common_validation_metrics(shared_result)
-        print_presentation_model_settings(shared_config, top_n=None if symbols_override is not None else top_n)
-        print_presentation_feature_fold_appendix(shared_config, metrics=metrics)
+        print_presentation_model_settings(shared_config, top_n=None if symbols_override is not None else top_n, investor_mode=investor_mode)
+        if not investor_mode:
+            print_presentation_feature_fold_appendix(shared_config, metrics=metrics)
         print("Output files:")
         print(f"ranking CSV: {ranking_csv}")
         print(f"ranking Excel: {ranking_xlsx}")

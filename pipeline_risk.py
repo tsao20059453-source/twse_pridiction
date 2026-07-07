@@ -622,6 +622,7 @@ def _safe_rate(numerator, denominator) -> float:
 
 
 def apply_second_layer_rule_filter(row: pd.Series) -> pd.Series:
+    # scoring_version: [primary +0.10] [secondary +0.05] layered rule filter v2
     score = 0.50
     penalty_points = 0.0
     notes = []
@@ -633,51 +634,73 @@ def apply_second_layer_rule_filter(row: pd.Series) -> pd.Series:
             penalty_points += abs(delta)
         notes.append(note)
 
+    # ── 主要指標（±0.10） ─────────────────────────────────────────────
     rsi14 = _row_number(row, "RSI14")
     if pd.notna(rsi14):
         if 45 <= rsi14 <= 65:
-            add_rule(0.08, "RSI14 in constructive neutral range")
+            add_rule(0.10, "RSI14 in constructive neutral range")
         elif 65 < rsi14 <= 70:
-            add_rule(0.03, "RSI14 positive but near overheat")
+            add_rule(0.05, "RSI14 positive but near overheat")
+        elif 70 < rsi14 <= 75:
+            add_rule(-0.05, "RSI14 overbought")
         elif rsi14 > 75:
-            add_rule(-0.12, "RSI14 extremely overbought")
-        elif rsi14 > 70:
-            add_rule(-0.08, "RSI14 overbought")
+            add_rule(-0.10, "RSI14 extremely overbought")
+        elif 30 <= rsi14 < 40:
+            add_rule(-0.05, "RSI14 weak")
         elif rsi14 < 30:
             add_rule(-0.10, "RSI14 oversold or weak")
-        elif rsi14 < 40:
-            add_rule(-0.05, "RSI14 weak")
 
+    support_distance = _row_number(row, "support_distance")
+    if pd.notna(support_distance):
+        if 0 <= support_distance < 0.03:
+            add_rule(0.10, "price close to support")
+        elif 0.03 <= support_distance < 0.06:
+            pass  # neutral
+        elif 0.06 <= support_distance < 0.08:
+            add_rule(-0.05, "support distance is wide")
+        elif support_distance >= 0.08:
+            add_rule(-0.10, "price far from support")
+
+    resistance_distance = _row_number(row, "resistance_distance")
+    if pd.notna(resistance_distance):
+        if resistance_distance > 0.10:
+            add_rule(0.10, "resistance distance leaves upside room")
+        elif 0.06 <= resistance_distance <= 0.10:
+            pass  # neutral
+        elif 0.03 <= resistance_distance < 0.06:
+            add_rule(-0.05, "limited upside before resistance")
+        elif resistance_distance < 0.03:
+            add_rule(-0.10, "resistance too close")
+
+    # ── 次要指標（±0.05） ─────────────────────────────────────────────
     macd = _row_number(row, "MACD")
     dif = _row_number(row, "DIF")
     dea = _row_number(row, "DEA")
     if pd.notna(macd):
-        add_rule(0.06 if macd > 0 else -0.06, "MACD positive" if macd > 0 else "MACD negative")
+        add_rule(0.05 if macd > 0 else -0.05, "MACD positive" if macd > 0 else "MACD negative")
     if pd.notna(dif) and pd.notna(dea):
-        add_rule(0.04 if dif > dea else -0.04, "DIF above DEA" if dif > dea else "DIF below DEA")
+        add_rule(0.05 if dif > dea else -0.05, "DIF above DEA" if dif > dea else "DIF below DEA")
 
     k_value = _row_number(row, "K")
     d_value = _row_number(row, "D")
     j_value = _row_number(row, "J")
     if pd.notna(k_value) and pd.notna(d_value):
         if k_value > d_value and k_value < 80:
-            add_rule(0.04, "KDJ bullish crossover without overheat")
+            add_rule(0.05, "KDJ bullish crossover without overheat")
         elif k_value <= d_value:
-            add_rule(-0.04, "KDJ not yet bullish")
+            add_rule(-0.05, "KDJ not yet bullish")
     if pd.notna(j_value):
         if j_value > 100:
-            add_rule(-0.08, "KDJ J value overheated")
+            add_rule(-0.05, "KDJ J value overheated")
         elif j_value < 0:
-            add_rule(-0.06, "KDJ J value weak")
+            add_rule(-0.05, "KDJ J value weak")
 
     bias24 = _row_number(row, "BIAS24")
     if pd.notna(bias24):
         if -3 <= bias24 <= 6:
             add_rule(0.05, "BIAS24 in moderate range")
-        elif bias24 > 12:
-            add_rule(-0.10, "BIAS24 too extended")
         elif bias24 > 8:
-            add_rule(-0.06, "BIAS24 elevated")
+            add_rule(-0.05, "BIAS24 elevated")
         elif bias24 < -10:
             add_rule(-0.05, "BIAS24 very weak")
 
@@ -686,56 +709,38 @@ def apply_second_layer_rule_filter(row: pd.Series) -> pd.Series:
         if pd.isna(vr_value):
             continue
         if 80 <= vr_value <= 180:
-            add_rule(0.02, f"{vr_col} balanced")
+            add_rule(0.05, f"{vr_col} balanced")
         elif vr_value > 250:
             add_rule(-0.05, f"{vr_col} overheated")
         elif vr_value < 60:
-            add_rule(-0.04, f"{vr_col} weak volume confirmation")
+            add_rule(-0.05, f"{vr_col} weak volume confirmation")
 
     fib_position = _row_number(row, "fib_position")
     if pd.notna(fib_position):
         if fib_position < 0.50:
-            add_rule(0.06, "fib_position in lower half of range")
+            add_rule(0.05, "fib_position in lower half of range")
         elif fib_position <= 0.786:
-            add_rule(0.03, "fib_position in middle range")
-        elif fib_position > 0.90:
-            add_rule(-0.08, "fib_position near range high")
+            pass  # neutral, no adjustment
+        elif fib_position <= 0.90:
+            add_rule(-0.05, "fib_position elevated")
         else:
-            add_rule(-0.04, "fib_position elevated")
-
-    support_distance = _row_number(row, "support_distance")
-    if pd.notna(support_distance):
-        if 0 <= support_distance < 0.03:
-            add_rule(0.04, "price close to support")
-        elif support_distance > 0.08:
-            add_rule(-0.08, "price far from support")
-        elif support_distance > 0.06:
-            add_rule(-0.05, "support distance is wide")
-
-    resistance_distance = _row_number(row, "resistance_distance")
-    if pd.notna(resistance_distance):
-        if 0 <= resistance_distance < 0.03:
-            add_rule(-0.10, "resistance too close")
-        elif resistance_distance < 0.06:
-            add_rule(-0.05, "limited upside before resistance")
-        elif resistance_distance > 0.10:
-            add_rule(0.05, "resistance distance leaves upside room")
+            add_rule(-0.05, "fib_position near range high")
 
     atr_pct = _row_number(row, "atr_pct")
     if pd.notna(atr_pct):
         if 0.015 <= atr_pct <= 0.035:
-            add_rule(0.03, "ATR percent in manageable range")
+            add_rule(0.05, "ATR percent in manageable range")
+        elif 0.04 <= atr_pct <= 0.06:
+            add_rule(-0.05, "ATR percent elevated")
         elif atr_pct > 0.06:
-            add_rule(-0.10, "ATR percent too high")
-        elif atr_pct > 0.04:
-            add_rule(-0.06, "ATR percent elevated")
+            add_rule(-0.05, "ATR percent too high")
         elif atr_pct < 0.015:
-            add_rule(-0.03, "ATR percent very low")
+            add_rule(-0.05, "ATR percent very low")
 
     if _has_material_warning(row.get("risk_warning", "")):
-        add_rule(-0.08, "risk warning requires protection")
+        add_rule(-0.05, "risk warning requires protection")
     if _has_material_warning(row.get("model_confidence_note", "")):
-        add_rule(-0.04, "model confidence note requires caution")
+        add_rule(-0.05, "model confidence note requires caution")
 
     score = _clip01(score, default=0.50)
     penalty_points = _clip01(penalty_points, default=0.0)

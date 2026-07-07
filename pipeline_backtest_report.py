@@ -353,6 +353,7 @@ def _symbol_eligibility_cutoff_date(
 def filter_suitable_symbols(
     oos_df: pd.DataFrame,
     config: PipelineConfig,
+    investor_mode: bool = False,
 ) -> tuple[list[str], list[str], dict[str, str]]:
     """
     股票適用性過濾：使用全部 12 折 OOS 驗證資料，以既有單股回測引擎（run_backtest）
@@ -399,7 +400,7 @@ def filter_suitable_symbols(
 
         # ── 全折回測 ──────────────────────────────────────────────────
         try:
-            tl_all, _ec = run_backtest(sym_all, sym_config, mode="single")
+            tl_all, _ec = run_backtest(sym_all, sym_config, mode="single", investor_mode=investor_mode)
         except Exception:
             passed_symbols.append(sym)
             continue
@@ -443,7 +444,7 @@ def filter_suitable_symbols(
             sym_late = late_folds_df[late_folds_df["symbol"].astype(str) == sym].copy()
             if not sym_late.empty:
                 try:
-                    tl_late, _ec2 = run_backtest(sym_late, sym_config, mode="single")
+                    tl_late, _ec2 = run_backtest(sym_late, sym_config, mode="single", investor_mode=investor_mode)
                     if tl_late is not None and not tl_late.empty and "return_pct" in tl_late.columns:
                         rets_late = pd.to_numeric(tl_late["return_pct"], errors="coerce").dropna()
                         if not rets_late.empty:
@@ -460,9 +461,10 @@ def filter_suitable_symbols(
     passed_symbols   = sorted(passed_symbols)
     excluded_symbols = sorted(excluded_symbols)
 
-    print("股票適用性過濾結果：")
-    print(f"通過篩選：{passed_symbols}")
-    print(f"被排除：{excluded_symbols}（原因：{exclusion_reasons}）")
+    if not investor_mode:
+        print("股票適用性過濾結果：")
+        print(f"通過篩選：{passed_symbols}")
+        print(f"被排除：{excluded_symbols}（原因：{exclusion_reasons}）")
 
     return passed_symbols, excluded_symbols, exclusion_reasons
 
@@ -471,6 +473,7 @@ def print_portfolio_report(
     metrics: dict,
     equity_curve: pd.DataFrame,
     config: PipelineConfig,
+    investor_mode: bool = False,
 ) -> None:
     """輸出 Portfolio 層級績效報告，並將每日淨值曲線輸出為 CSV。"""
     initial_capital = config.backtest_initial_capital
@@ -541,89 +544,90 @@ def print_portfolio_report(
         print("大盤過濾啟動天數：N/A")
     print(f"大盤過濾期間避免的潛在進場次數：{filtered_entries}")
 
-    # ── return_20d_score 分組績效統計 ─────────────────────────────────
-    high_r20d_count = metrics.get("high_return_20d_count", 0)
-    high_r20d_avg   = metrics.get("high_return_20d_avg_return", float("nan"))
-    low_r20d_avg    = metrics.get("low_return_20d_avg_return", float("nan"))
-    if total_entries > 0:
-        print(f"return_20d_score daily rank 前 30% 的進場次數：{high_r20d_count}（{high_r20d_count / total_entries:.1%}）")
-    else:
-        print("return_20d_score daily rank 前 30% 的進場次數：N/A")
-    print(f"高 return_20d_score 交易的平均報酬：{high_r20d_avg:.2%}" if pd.notna(high_r20d_avg) else "高 return_20d_score 交易的平均報酬：N/A")
-    print(f"低 return_20d_score 交易的平均報酬：{low_r20d_avg:.2%}" if pd.notna(low_r20d_avg) else "低 return_20d_score 交易的平均報酬：N/A")
-
-    r20d_stats = metrics.get("return_20d_score_stats", {})
-    print()
-    print("return_20d_score 驗收診斷：")
-    print(f"return_20d_score 欄位存在：{bool(r20d_stats.get('column_present', False))}")
-    _r20d_nonzero = r20d_stats.get("nonzero_ratio", float("nan"))
-    print(f"return_20d_score 非零值比例：{_r20d_nonzero:.1%}" if pd.notna(_r20d_nonzero) else "return_20d_score 非零值比例：N/A")
-    _r20d_mean = r20d_stats.get("mean", float("nan"))
-    print(f"return_20d_score 平均值：{_r20d_mean:.3f}" if pd.notna(_r20d_mean) else "return_20d_score 平均值：N/A")
-    print(f"OOS/Portfolio dataframe 欄位存在：{bool(r20d_stats.get('column_present', False))}")
-    print(f"count：{int(r20d_stats.get('count', 0) or 0)}")
-    print(f"return_20d_score_daily_rank 欄位存在：{bool(r20d_stats.get('daily_rank_column_present', False))}")
-    print(f"daily_rank_top30_count：{int(r20d_stats.get('daily_rank_top30_count', 0) or 0)}")
-    print(f"daily_rank_top20_count：{int(r20d_stats.get('daily_rank_top20_count', 0) or 0)}")
-    for key, label in [
-        ("mean", "mean"),
-        ("min", "min"),
-        ("max", "max"),
-        ("q25", "25%"),
-        ("q50", "50%"),
-        ("q75", "75%"),
-        ("nan_ratio", "NaN 比例"),
-    ]:
-        value = r20d_stats.get(key, np.nan)
-        if key == "nan_ratio":
-            print(f"{label}：{value:.1%}" if pd.notna(value) else f"{label}：N/A")
+    if not investor_mode:
+        # ── return_20d_score 分組績效統計 ─────────────────────────────────
+        high_r20d_count = metrics.get("high_return_20d_count", 0)
+        high_r20d_avg   = metrics.get("high_return_20d_avg_return", float("nan"))
+        low_r20d_avg    = metrics.get("low_return_20d_avg_return", float("nan"))
+        if total_entries > 0:
+            print(f"return_20d_score daily rank 前 30% 的進場次數：{high_r20d_count}（{high_r20d_count / total_entries:.1%}）")
         else:
-            print(f"{label}：{value:.4f}" if pd.notna(value) else f"{label}：N/A")
-    print(f"進場缺值改以 0.5 處理次數：{int(r20d_stats.get('entry_missing_filled_count', 0) or 0)}")
-    print(f"缺值處理原因：{r20d_stats.get('missing_fill_reason', 'N/A')}")
+            print("return_20d_score daily rank 前 30% 的進場次數：N/A")
+        print(f"高 return_20d_score 交易的平均報酬：{high_r20d_avg:.2%}" if pd.notna(high_r20d_avg) else "高 return_20d_score 交易的平均報酬：N/A")
+        print(f"低 return_20d_score 交易的平均報酬：{low_r20d_avg:.2%}" if pd.notna(low_r20d_avg) else "低 return_20d_score 交易的平均報酬：N/A")
 
-    missing_cols = metrics.get("missing_trade_log_columns", [])
-    print()
-    print("交易紀錄欄位驗收：")
-    if missing_cols:
-        print(f"缺少欄位：{missing_cols}")
-    else:
-        print("必要欄位：全部存在")
+        r20d_stats = metrics.get("return_20d_score_stats", {})
+        print()
+        print("return_20d_score 驗收診斷：")
+        print(f"return_20d_score 欄位存在：{bool(r20d_stats.get('column_present', False))}")
+        _r20d_nonzero = r20d_stats.get("nonzero_ratio", float("nan"))
+        print(f"return_20d_score 非零值比例：{_r20d_nonzero:.1%}" if pd.notna(_r20d_nonzero) else "return_20d_score 非零值比例：N/A")
+        _r20d_mean = r20d_stats.get("mean", float("nan"))
+        print(f"return_20d_score 平均值：{_r20d_mean:.3f}" if pd.notna(_r20d_mean) else "return_20d_score 平均值：N/A")
+        print(f"OOS/Portfolio dataframe 欄位存在：{bool(r20d_stats.get('column_present', False))}")
+        print(f"count：{int(r20d_stats.get('count', 0) or 0)}")
+        print(f"return_20d_score_daily_rank 欄位存在：{bool(r20d_stats.get('daily_rank_column_present', False))}")
+        print(f"daily_rank_top30_count：{int(r20d_stats.get('daily_rank_top30_count', 0) or 0)}")
+        print(f"daily_rank_top20_count：{int(r20d_stats.get('daily_rank_top20_count', 0) or 0)}")
+        for key, label in [
+            ("mean", "mean"),
+            ("min", "min"),
+            ("max", "max"),
+            ("q25", "25%"),
+            ("q50", "50%"),
+            ("q75", "75%"),
+            ("nan_ratio", "NaN 比例"),
+        ]:
+            value = r20d_stats.get(key, np.nan)
+            if key == "nan_ratio":
+                print(f"{label}：{value:.1%}" if pd.notna(value) else f"{label}：N/A")
+            else:
+                print(f"{label}：{value:.4f}" if pd.notna(value) else f"{label}：N/A")
+        print(f"進場缺值改以 0.5 處理次數：{int(r20d_stats.get('entry_missing_filled_count', 0) or 0)}")
+        print(f"缺值處理原因：{r20d_stats.get('missing_fill_reason', 'N/A')}")
 
-    print()
-    print("Portfolio 執行事件摘要：")
-    print(f"同股加碼次數（獲利中）：{int(metrics.get('same_stock_add_count', 0) or 0)}")
-    print(f"冷卻期觸發次數（停損事件數）：{int(metrics.get('cooldown_triggered_count', 0) or 0)}")
-    print(f"冷卻期擋下次數：{int(metrics.get('cooldown_rejected_count', 0) or 0)}")
-    print(f"冷卻期後重新進場次數：{int(metrics.get('post_cooldown_entries', 0) or 0)}")
-    print(f"分批出場後新試倉次數：{int(metrics.get('post_partial_exit_entries', 0) or 0)}")
-    print(f"假跌破次數：{int(metrics.get('false_breakdown_count', 0) or 0)}")
-    print(f"跳空停損次數：{int(metrics.get('gap_down_stop_count', 0) or 0)}")
-    print(f"收盤確認停損次數：{int(metrics.get('close_confirm_stop_count', 0) or 0)}")
-    print(f"trailing stop 出場次數：{int(metrics.get('trailing_stop_exit_count', 0) or 0)}")
-    print(f"獲利 30% 分批出場次數：{int(metrics.get('profit_30_count', 0) or 0)}")
-    print(f"獲利 50% 全出次數：{int(metrics.get('profit_50_count', 0) or 0)}")
-    print(f"趨勢結構破壞出場次數：{int(metrics.get('trend_break_count', 0) or 0)}")
-    print(f"60日期限到期次數：{int(metrics.get('expired_count', 0) or 0)}")
-    print(f"獲利出場後重新進場次數：{int(metrics.get('re_entry_count', 0) or 0)}")
-    _avg_pp = metrics.get("avg_peak_profit", float("nan"))
-    print(f"持倉期間平均最高獲利率：{_avg_pp:.2%}" if pd.notna(_avg_pp) else "持倉期間平均最高獲利率：N/A")
+        missing_cols = metrics.get("missing_trade_log_columns", [])
+        print()
+        print("交易紀錄欄位驗收：")
+        if missing_cols:
+            print(f"缺少欄位：{missing_cols}")
+        else:
+            print("必要欄位：全部存在")
 
-    add2_diag = metrics.get("add2_diagnostics", {})
-    print()
-    print("第二次加碼診斷：")
-    for key in [
-        "add2_candidate_count",
-        "rejected_add2_by_score",
-        "rejected_add2_by_support_quality",
-        "rejected_add2_by_cash",
-        "rejected_add2_by_exposure",
-        "rejected_add2_by_price_condition",
-        "rejected_add2_by_trend_condition",
-        "rejected_add2_by_defense_line",
-        "rejected_add2_by_existing_flag",
-    ]:
-        print(f"{key}：{int(add2_diag.get(key, 0) or 0)}")
+        print()
+        print("Portfolio 執行事件摘要：")
+        print(f"同股加碼次數（獲利中）：{int(metrics.get('same_stock_add_count', 0) or 0)}")
+        print(f"冷卻期觸發次數（停損事件數）：{int(metrics.get('cooldown_triggered_count', 0) or 0)}")
+        print(f"冷卻期擋下次數：{int(metrics.get('cooldown_rejected_count', 0) or 0)}")
+        print(f"冷卻期後重新進場次數：{int(metrics.get('post_cooldown_entries', 0) or 0)}")
+        print(f"分批出場後新試倉次數：{int(metrics.get('post_partial_exit_entries', 0) or 0)}")
+        print(f"假跌破次數：{int(metrics.get('false_breakdown_count', 0) or 0)}")
+        print(f"跳空停損次數：{int(metrics.get('gap_down_stop_count', 0) or 0)}")
+        print(f"收盤確認停損次數：{int(metrics.get('close_confirm_stop_count', 0) or 0)}")
+        print(f"trailing stop 出場次數：{int(metrics.get('trailing_stop_exit_count', 0) or 0)}")
+        print(f"獲利 30% 分批出場次數：{int(metrics.get('profit_30_count', 0) or 0)}")
+        print(f"獲利 50% 全出次數：{int(metrics.get('profit_50_count', 0) or 0)}")
+        print(f"趨勢結構破壞出場次數：{int(metrics.get('trend_break_count', 0) or 0)}")
+        print(f"60日期限到期次數：{int(metrics.get('expired_count', 0) or 0)}")
+        print(f"獲利出場後重新進場次數：{int(metrics.get('re_entry_count', 0) or 0)}")
+        _avg_pp = metrics.get("avg_peak_profit", float("nan"))
+        print(f"持倉期間平均最高獲利率：{_avg_pp:.2%}" if pd.notna(_avg_pp) else "持倉期間平均最高獲利率：N/A")
+
+        add2_diag = metrics.get("add2_diagnostics", {})
+        print()
+        print("第二次加碼診斷：")
+        for key in [
+            "add2_candidate_count",
+            "rejected_add2_by_score",
+            "rejected_add2_by_support_quality",
+            "rejected_add2_by_cash",
+            "rejected_add2_by_exposure",
+            "rejected_add2_by_price_condition",
+            "rejected_add2_by_trend_condition",
+            "rejected_add2_by_defense_line",
+            "rejected_add2_by_existing_flag",
+        ]:
+            print(f"{key}：{int(add2_diag.get(key, 0) or 0)}")
 
     entry_diag = metrics.get("entry_diagnostics", {})
     primary_counts = metrics.get("entry_primary_rejection_counts", {})
@@ -692,7 +696,7 @@ def print_portfolio_report(
         reverse=True,
     )
 
-    if entry_diag:
+    if entry_diag and not investor_mode:
         print()
         print("\u9032\u5834\u8a0a\u865f\u8a3a\u65b7\uff1a")
         for key, label, value_type in entry_signal_display_rows:
@@ -748,7 +752,7 @@ def print_portfolio_report(
     print("每月績效：")
 
     rejection_future_summary = metrics.get("rejection_future_return_summary")
-    if isinstance(rejection_future_summary, pd.DataFrame) and not rejection_future_summary.empty:
+    if not investor_mode and isinstance(rejection_future_summary, pd.DataFrame) and not rejection_future_summary.empty:
         print()
         print("Rejected Signal Forward Return Diagnostics:")
         display_rej = rejection_future_summary.copy()
@@ -760,7 +764,7 @@ def print_portfolio_report(
         print(display_rej.to_string(index=False))
 
     trailing_future_summary = metrics.get("trailing_stop_future_return_summary")
-    if isinstance(trailing_future_summary, pd.DataFrame) and not trailing_future_summary.empty:
+    if not investor_mode and isinstance(trailing_future_summary, pd.DataFrame) and not trailing_future_summary.empty:
         print()
         print("Trailing Stop Forward Return Diagnostics:")
         display_ts = trailing_future_summary.copy()
@@ -1301,6 +1305,7 @@ def run_backtest_mode(
     target_symbol: Optional[str] = None,
     mode: str = "single",
     run_profile_experiments: bool = False,
+    investor_mode: bool = False,
 ) -> None:
     """
     Top-level coordinator for Mode 3 backtest analysis.
@@ -1310,7 +1315,10 @@ def run_backtest_mode(
     import contextlib, io
     from pathlib import Path
 
-    print_presentation_process_header()
+    if investor_mode:
+        print("正在分析市場資料...")
+    else:
+        print_presentation_process_header()
 
     stock_list, symbols = build_shared_common_stock_pool(
         base_config=config,
@@ -1323,15 +1331,16 @@ def run_backtest_mode(
         shared_config = replace(shared_config, stock_no=target_symbol)
 
     print(f"Step 1/3: 抓取 {len(symbols)} 支股票的歷史資料...")
-    print("[DEBUG Backtest Config]")
-    print("mode =", getattr(shared_config, "mode", None))
-    print("analysis_mode =", getattr(shared_config, "analysis_mode", None))
-    print("feature_set =", getattr(shared_config, "feature_set", None))
-    print("target_mode =", getattr(shared_config, "target_mode", None))
-    print("target_col =", getattr(shared_config, "target_col", None))
-    print("use_sensitivity =", getattr(shared_config, "use_sensitivity", None))
-    print("require_sensitivity_data =", getattr(shared_config, "require_sensitivity_data", None))
-    print("use_return_20d =", getattr(shared_config, "use_return_20d", None))
+    if not investor_mode:
+        print("[DEBUG Backtest Config]")
+        print("mode =", getattr(shared_config, "mode", None))
+        print("analysis_mode =", getattr(shared_config, "analysis_mode", None))
+        print("feature_set =", getattr(shared_config, "feature_set", None))
+        print("target_mode =", getattr(shared_config, "target_mode", None))
+        print("target_col =", getattr(shared_config, "target_col", None))
+        print("use_sensitivity =", getattr(shared_config, "use_sensitivity", None))
+        print("require_sensitivity_data =", getattr(shared_config, "require_sensitivity_data", None))
+        print("use_return_20d =", getattr(shared_config, "use_return_20d", None))
     with contextlib.redirect_stdout(io.StringIO()):
         combined_data = fetch_and_prepare_multi_stock_data_with_config(
             symbols=symbols,
@@ -1348,6 +1357,39 @@ def run_backtest_mode(
     if oos_df.empty:
         print("OOS 預測資料不足，無法執行回測。")
         return
+
+    # ── 候選股排名：最後一個交易日，依 final_decision_score 降序 Top 10 ──
+    if "final_decision_score" in oos_df.columns and "date" in oos_df.columns:
+        _cv = getattr(
+            config,
+            "backtest_profile_name",
+            getattr(config, "backtest_portfolio_config_version", "portfolio"),
+        )
+        _ts_cand = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        _last_date = oos_df["date"].max()
+        _last_day = oos_df[oos_df["date"] == _last_date].copy()
+        _last_day["final_decision_score"] = pd.to_numeric(
+            _last_day["final_decision_score"], errors="coerce"
+        )
+        _last_day = (
+            _last_day
+            .sort_values("final_decision_score", ascending=False)
+            .head(10)
+            .reset_index(drop=True)
+        )
+        _want_cols = [
+            "symbol", "date",
+            "final_decision_score", "safety_score", "return_score",
+            "rule_filter_score", "risk_reward_score",
+            "score_band", "decision_action", "technical_filter_result",
+            "entry_rr_1", "support_entry_zone_low", "support_entry_zone_high",
+        ]
+        _out_cols = [c for c in _want_cols if c in _last_day.columns]
+        _cand_dir = Path(getattr(config, "output_dir", "output"))
+        _cand_dir.mkdir(exist_ok=True)
+        _cand_path = _cand_dir / f"top_candidates_{_cv}_{_ts_cand}.csv"
+        _last_day[_out_cols].to_csv(_cand_path, index=False, encoding="utf-8-sig")
+        print(f"候選股排名已輸出（最後交易日：{_last_date}）：{_cand_path}")
 
     if mode == "single":
         # 單股模式：過濾至目標股票
@@ -1375,9 +1417,10 @@ def run_backtest_mode(
             config=bt_config,
             market_df=single_market_df,
             expected_symbols=[single_symbol],
+            investor_mode=investor_mode,
         )
         print()
-        print_portfolio_report(metrics, equity_curve, bt_config)
+        print_portfolio_report(metrics, equity_curve, bt_config, investor_mode=investor_mode)
 
         if not trade_log.empty:
             print("\n交易明細（Portfolio execution engine）：")
@@ -1438,7 +1481,7 @@ def run_backtest_mode(
                 continue
             sym_config = replace(config, stock_no=sym)
             try:
-                tl, ec = run_backtest(sym_oos, sym_config, mode="single")
+                tl, ec = run_backtest(sym_oos, sym_config, mode="single", investor_mode=investor_mode)
             except Exception as exc:
                 print(f"  [{i}/{len(bt_symbols)}] {sym} 回測失敗：{exc}")
                 continue
@@ -1524,25 +1567,27 @@ def run_backtest_mode(
             })
             n_trades  = len(tl)
             total_ret = m.get("total_return", 0)
-            print(f"  [{i}/{len(bt_symbols)}] {sym}：{n_trades} 筆交易，總報酬 {total_ret:.1%}")
+            if not investor_mode or i % 10 == 0 or i == len(bt_symbols):
+                print(f"  [{i}/{len(bt_symbols)}] {sym}：{n_trades} 筆交易，總報酬 {total_ret:.1%}")
 
         # 合併交易紀錄
         combined_log = pd.concat(all_trade_logs, ignore_index=True) if all_trade_logs else pd.DataFrame()
 
         # ── 逐股績效表 ──────────────────────────────────────────────────────
-        print()
-        print("=" * 90)
-        print("批次回測 — 逐股績效彙整")
-        print("=" * 90)
-        if per_symbol_rows:
-            perf_df = pd.DataFrame(per_symbol_rows)
-            print(perf_df.to_string(index=False))
-        else:
-            print("無有效回測結果。")
-        print("=" * 90)
+        perf_df = pd.DataFrame(per_symbol_rows) if per_symbol_rows else pd.DataFrame()
+        if not investor_mode:
+            print()
+            print("=" * 90)
+            print("批次回測 — 逐股績效彙整")
+            print("=" * 90)
+            if per_symbol_rows:
+                print(perf_df.to_string(index=False))
+            else:
+                print("無有效回測結果。")
+            print("=" * 90)
 
         # ── 策略適用性評估 ───────────────────────────────────────────────────
-        if raw_metrics_list:
+        if raw_metrics_list and not investor_mode:
             high_quality: list[str] = []
             not_suitable: list[str] = []
             for rm in raw_metrics_list:
@@ -1562,7 +1607,7 @@ def run_backtest_mode(
             print(f"策略不適用（建議排除）：{ns_str}")
 
         # ── 整體合併績效報告 ─────────────────────────────────────────────────
-        if not combined_log.empty and raw_metrics_list:
+        if not combined_log.empty and raw_metrics_list and not investor_mode:
             print()
             print("=" * 70)
             print("整體合併績效報告（所有股票合併計算）")
@@ -1754,7 +1799,7 @@ def run_backtest_mode(
         eligibility_cutoff_date = None
         if use_symbol_filter:
             try:
-                passed_symbols, excluded_symbols, exclusion_reasons = filter_suitable_symbols(oos_df, config)
+                passed_symbols, excluded_symbols, exclusion_reasons = filter_suitable_symbols(oos_df, config, investor_mode=investor_mode)
             except Exception as exc:
                 print(f"股票適用性過濾失敗，改用全部 Top N 股票：{exc}")
                 passed_symbols, excluded_symbols, exclusion_reasons = list(bt_symbols), [], {}
@@ -1797,6 +1842,7 @@ def run_backtest_mode(
                 config=config,
                 market_df=taiex_index_df,
                 expected_symbols=bt_symbols,
+                investor_mode=investor_mode,
             )
         except Exception as exc:
             print(f"Portfolio 層級回測失敗：{exc}")
@@ -1821,7 +1867,7 @@ def run_backtest_mode(
                 pf_equity_curve = pf_equity_curve.merge(benchmark_df, on="date", how="left")
 
         print()
-        print_portfolio_report(pf_metrics, pf_equity_curve, config)
+        print_portfolio_report(pf_metrics, pf_equity_curve, config, investor_mode=investor_mode)
 
         if benchmark_metrics:
             print()
