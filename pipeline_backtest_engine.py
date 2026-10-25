@@ -274,6 +274,8 @@ def generate_oos_predictions_for_backtest(
     df: pd.DataFrame,
     config: PipelineConfig,
     n_splits: int = 12,
+    min_train_dates: Optional[int] = None,
+    min_train_date_cutoff: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Rolling walk-forward OOS predictions for backtesting.
@@ -350,7 +352,20 @@ def generate_oos_predictions_for_backtest(
         y_return20d    = pd.Series(np.nan, index=model_df.index)
 
     unique_dates_bt = pd.Series(pd.to_datetime(model_df["date"]).dropna().unique()).sort_values()
-    min_train_size = max(126, len(unique_dates_bt) // 4)
+    model_df_valid_start = unique_dates_bt.min().date() if not unique_dates_bt.empty else "N/A"
+    print(f"[回測資料生成] model_df 有效起始日期（valid_mask後）：{model_df_valid_start}，"
+          f"總有效交易日數：{len(unique_dates_bt)}")
+    if min_train_date_cutoff is not None:
+        # Count valid model_df dates (post valid_mask) before the cutoff — exact, no indicator-warmup guessing
+        cutoff_ts = pd.Timestamp(min_train_date_cutoff)
+        valid_before_cutoff = int((unique_dates_bt < cutoff_ts).sum())
+        min_train_size = max(valid_before_cutoff, 20)
+        print(f"[回測資料生成] min_train_size 自 model_df 計算：cutoff={min_train_date_cutoff}，"
+              f"有效交易日數={valid_before_cutoff}（= 動態 min_train_dates），min_train_size={min_train_size}")
+    elif min_train_dates is not None:
+        min_train_size = min_train_dates
+    else:
+        min_train_size = max(126, len(unique_dates_bt) // 4)
     splits = build_walk_forward_splits_by_date(model_df=model_df, n_splits=n_splits, min_train_dates=min_train_size)
 
     oos_frames: list[pd.DataFrame] = []
@@ -419,6 +434,11 @@ def generate_oos_predictions_for_backtest(
         with contextlib.redirect_stdout(io.StringIO()):
             fold_df = apply_enhanced_decision_layers(fold_df)
 
+        if fold_no == 1:
+            train_end_date = latest_td.date() if pd.notna(latest_td) else "N/A"
+            train_start_date = train_dates.min().date() if not train_dates.empty else "N/A"
+            print(f"[回測資料生成] Fold 1 train：{train_start_date} ~ {train_end_date}  "
+                  f"→ test_fold_1 起始：{test_start}")
         print(
             f"[回測資料生成] Fold {fold_no}/{n_splits}："
             f"{test_start} ~ {test_end}，{len(test_idx)} 筆"

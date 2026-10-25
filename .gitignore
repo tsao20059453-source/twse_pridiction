@@ -1,4 +1,4 @@
-﻿# Python cache
+# Python cache
 __pycache__/
 *.py[cod]
 
@@ -44,3 +44,51 @@ pipe_*.txt
 # Streamlit cache
 .streamlit/secrets.toml
 
+.env
+
+# Yuanta credentials
+.env
+*.pfx
+
+# Yuanta SDK binaries
+broker/yuanta/*.dll
+broker/yuanta/*.so
+broker/yuanta/*.dylib
+
+# Yuanta runtime files
+broker/yuanta/*.deps.json
+broker/yuanta/*.runtimeconfig.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+
+# Credentials
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+.streamlit/secrets.toml
+
+# Large datasets and cache
+data/raw/
+data/cache/
+
+# IDE
+.idea/
+.vscode/
+
+# ---- 專題資料夾（2026-10-25 起）----
+# 大型或一次性檔案，不進版本控制
+*.zip
+*.log
+broker/
+補齊大型檔案.bat
+資料夾說明.md

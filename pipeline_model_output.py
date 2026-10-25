@@ -3490,6 +3490,119 @@ def fetch_and_prepare_multi_stock_data_with_config(
     return combined_data
 
 
+def fetch_and_prepare_multi_stock_data_historical(
+    symbols: list[str],
+    base_config: PipelineConfig,
+    start_date: str,
+    end_date: str,
+    burn_in_months: int = 12,
+) -> pd.DataFrame:
+    """
+    歷史區間版本的多股票資料準備函式。
+    與 fetch_and_prepare_multi_stock_data_with_config() 的差別：
+    改呼叫 get_historical_trading_data() / get_historical_market_index_data()，
+    抓取 [start_date - burn_in_months, end_date] 區間資料（不依賴 datetime.today()）。
+    特徵計算、target 建構邏輯與原函式完全相同。
+    """
+    all_frames = []
+    market_index_df = get_historical_market_index_data(
+        config=base_config,
+        start_date=start_date,
+        end_date=end_date,
+        burn_in_months=burn_in_months,
+    )
+
+    for symbol in symbols:
+        try:
+            print("\n" + "-" * 70)
+            print(f"[HIST] 開始處理歷史回測股票：{base_config.market} {symbol}")
+            print(
+                "profile config："
+                f"fib={base_config.fib_lookback_days}, "
+                f"ob={base_config.ob_lookback_days}, "
+                f"sr={base_config.sr_lookback_days}, "
+                f"atr_period={base_config.atr_period}, "
+                f"atr_multiplier={base_config.atr_multiplier}"
+            )
+            print("-" * 70)
+
+            config = replace(base_config, stock_no=symbol)
+            df = get_historical_trading_data(
+                config=config,
+                start_date=start_date,
+                end_date=end_date,
+                burn_in_months=burn_in_months,
+            )
+
+            if df is None or df.empty:
+                print(f"股票 {symbol} 無資料，略過。")
+                continue
+
+            df["symbol"] = symbol
+            df["market"] = config.market
+
+            _t0 = time.time()
+            df = add_technical_indicators(df, config)
+            print(f'[TIMER] add_technical_indicators: {time.time() - _t0:.1f}s')
+
+            _t0 = time.time()
+            df = add_stock_level_context_features(df, config, market_df=market_index_df)
+            print(f'[TIMER] add_stock_level_context_features: {time.time() - _t0:.1f}s')
+
+            _t0 = time.time()
+            df = add_market_structure_features(df, config)
+            print(f'[TIMER] add_market_structure_features: {time.time() - _t0:.1f}s')
+
+            _t0 = time.time()
+            df = add_stoploss_features(df, atr_multiplier=config.atr_multiplier)
+            print(f'[TIMER] add_stoploss_features: {time.time() - _t0:.1f}s')
+
+            _t0 = time.time()
+            df = add_structural_features(df)
+            print(f'[TIMER] add_structural_features: {time.time() - _t0:.1f}s')
+
+            df = clean_duplicate_columns(df)
+            df = add_risk_reward_target_score(
+                df,
+                horizon=config.horizon,
+                risk_penalty=config.risk_penalty,
+                opportunity_threshold=config.opportunity_threshold,
+            )
+            df = add_realized_history_features(df, horizon=config.horizon, report=False)
+            df["symbol"] = symbol
+            df["market"] = config.market
+
+            all_frames.append(df)
+            print(f"[HIST] 完成歷史回測股票 {symbol}，資料筆數：{len(df)}")
+
+        except Exception as e:
+            print(f"[HIST] 歷史回測股票 {symbol} 處理失敗：{e}")
+            continue
+
+    if not all_frames:
+        raise ValueError("所有股票皆無法取得有效歷史資料或特徵資料，無法訓練模型。")
+
+    combined_data = pd.concat(all_frames, ignore_index=True)
+
+    if "date" in combined_data.columns:
+        combined_data["date"] = pd.to_datetime(combined_data["date"])
+        combined_data = combined_data.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+    combined_data = add_low_subjective_targets(combined_data, horizon=base_config.horizon)
+    combined_data = add_cross_sectional_pool_features(combined_data)
+    combined_data = add_cross_sectional_rank_features(combined_data)
+    print_new_feature_availability(combined_data, context="historical multi-stock prepared data")
+
+    print("\n" + "=" * 70)
+    print("歷史回測 多股票資料合併完成")
+    print("=" * 70)
+    print(f"股票數量：{combined_data['symbol'].nunique()}")
+    print(f"總資料筆數：{len(combined_data)}")
+    print(f"日期範圍：{combined_data['date'].min()} ~ {combined_data['date'].max()}")
+
+    return combined_data
+
+
 def fetch_and_prepare_multi_stock_data(
     symbols: list[str],
     market: str,

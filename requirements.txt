@@ -1,0 +1,11 @@
+# 原專題套件版本（對齊 2026-09-21 回測時 ML based\.venv 的版本）
+numpy==2.4.5
+pandas==3.0.3
+scikit-learn==1.8.0
+scipy==1.17.1
+joblib==1.5.3
+requests==2.34.2
+urllib3==2.7.0
+openpyxl==3.1.5
+streamlit==1.58.0
+plotly==6.8.0

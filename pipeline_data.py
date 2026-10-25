@@ -110,7 +110,7 @@ class PipelineConfig:
     years: int = 3
     horizon: int = 10
     output_dir: str = "output"
-    sleep_sec: float = 0.3
+    sleep_sec: float = 2.0
     atr_period: int = 14
     atr_multiplier: float = 2.0
     ob_lookback_days: int = 10
@@ -859,7 +859,7 @@ def fetch_trading_data_months(
     months_to_fetch: int,
     start_from_month: Optional[datetime] = None,
     only_after_date: Optional[pd.Timestamp] = None,
-    sleep_sec: float = 0.3,
+    sleep_sec: float = 2.0,
 ) -> pd.DataFrame:
     today = datetime.today()
     monthly_frames: list[pd.DataFrame] = []
@@ -1064,7 +1064,7 @@ def fetch_market_index_months(
     months_to_fetch: int,
     start_from_month: Optional[datetime] = None,
     only_after_date: Optional[pd.Timestamp] = None,
-    sleep_sec: float = 0.3,
+    sleep_sec: float = 2.0,
 ) -> pd.DataFrame:
     if market.upper() != "TWSE":
         print(f"WARNING: market index features currently support TWSE only, got market={market}")
@@ -1149,6 +1149,89 @@ def get_market_index_data(config: PipelineConfig) -> pd.DataFrame:
         return cached_df
 
     return filter_to_recent_years(standardize_market_index_data(cached_df), config.years)
+
+
+def get_historical_trading_data(
+    config: PipelineConfig,
+    start_date: str,
+    end_date: str,
+    burn_in_months: int = 12,
+) -> pd.DataFrame:
+    """
+    抓取 [start_date - burn_in_months, end_date] 區間的個股資料。
+    不呼叫 filter_to_recent_years()，不受 datetime.today() 影響。
+    burn_in_months 讓 RSI14/MACD/ATR/BIAS 在 start_date 前有足夠 lookback。
+    """
+    validate_inputs(config.stock_no, config.market)
+    start_dt = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
+    end_dt   = datetime.strptime(str(end_date)[:10],   "%Y-%m-%d")
+    fetch_start = shift_month(start_dt, burn_in_months)
+    total_months = (
+        (end_dt.year - fetch_start.year) * 12
+        + (end_dt.month - fetch_start.month)
+        + 1
+    )
+    print(
+        f"[HIST] {config.stock_no} 抓取範圍：{fetch_start.strftime('%Y-%m')} ~ "
+        f"{end_dt.strftime('%Y-%m')}（{total_months} 個月，含 burn-in {burn_in_months} 個月）"
+    )
+    # fetch_trading_data_months 以 start_from_month 為最新月，往回抓 months_to_fetch 個月
+    df = fetch_trading_data_months(
+        stock_no=config.stock_no,
+        market=config.market,
+        months_to_fetch=total_months,
+        start_from_month=end_dt,
+        sleep_sec=config.sleep_sec,
+    )
+    if df.empty:
+        raise ValueError(
+            f"歷史資料抓取失敗：{config.stock_no} {start_date}~{end_date}（含 burn-in）"
+        )
+    df["symbol"] = config.stock_no
+    df["market"] = config.market.upper()
+    end_ts = pd.Timestamp(end_dt)
+    df = df[df["date"] <= end_ts].sort_values("date").reset_index(drop=True)
+    return df
+
+
+def get_historical_market_index_data(
+    config: PipelineConfig,
+    start_date: str,
+    end_date: str,
+    burn_in_months: int = 12,
+) -> pd.DataFrame:
+    """
+    抓取 [start_date - burn_in_months, end_date] 區間的 TAIEX 大盤資料。
+    不受 datetime.today() 影響。
+    """
+    if config.market.upper() != "TWSE":
+        print(f"WARNING: 歷史市場指數目前只支援 TWSE，market={config.market}；回傳空 DataFrame")
+        return pd.DataFrame(columns=["date", "market_close"])
+    start_dt = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
+    end_dt   = datetime.strptime(str(end_date)[:10],   "%Y-%m-%d")
+    fetch_start = shift_month(start_dt, burn_in_months)
+    total_months = (
+        (end_dt.year - fetch_start.year) * 12
+        + (end_dt.month - fetch_start.month)
+        + 1
+    )
+    print(
+        f"[HIST] TAIEX 抓取範圍：{fetch_start.strftime('%Y-%m')} ~ "
+        f"{end_dt.strftime('%Y-%m')}（{total_months} 個月，含 burn-in {burn_in_months} 個月）"
+    )
+    # fetch_market_index_months 以 start_from_month 為最新月，往回抓 months_to_fetch 個月
+    df = fetch_market_index_months(
+        market=config.market,
+        months_to_fetch=total_months,
+        start_from_month=end_dt,
+        sleep_sec=config.sleep_sec,
+    )
+    if df.empty:
+        print(f"WARNING: TAIEX 歷史資料抓取結果為空：{start_date}~{end_date}")
+        return df
+    end_ts = pd.Timestamp(end_dt)
+    df = df[df["date"] <= end_ts].sort_values("date").reset_index(drop=True)
+    return standardize_market_index_data(df)
 
 
 __all__ = [name for name in globals() if not name.startswith('__')]
