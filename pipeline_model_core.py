@@ -419,6 +419,10 @@ def get_feature_columns(df: pd.DataFrame, feature_set: str = "full") -> tuple[li
             "ma60_distance_cs_rank",
         ]
         numeric_features += [col for col in _extra_cs_ranks if col in df.columns]
+        # 籌碼與營收特徵（--chip-features；2026-10-26）
+        from pipeline_chip import CHIP_SETTINGS, chip_feature_columns
+        if CHIP_SETTINGS["enabled"]:
+            numeric_features += [col for col in chip_feature_columns(df) if col not in numeric_features]
         categorical_features = [
             "fib_zone",
             "recent_2w_ob_type",
@@ -1342,11 +1346,33 @@ def build_walk_forward_splits(
     return splits
 
 
+# ============================================================
+# Walk-forward 清洗期（purge，2026-10-26 新增）
+#   標籤 target_*_10d 會用到之後 10 個交易日的價格；若訓練集一路用到測試開始前一天，
+#   訓練集最後 10 天的標籤就已經包含測試期的價格（資料洩漏）。
+#   清洗期 = 在訓練集結尾刪掉 purge_dates 個交易日，讓訓練標籤在測試開始前就已實現。
+#   預設 10（= horizon）；設 0 可重現 2026-09-21 論文版的舊做法。
+# ============================================================
+WALK_FORWARD_SETTINGS: dict = {"purge_dates": 10}
+
+
+def set_walk_forward_purge(purge_dates: int) -> None:
+    WALK_FORWARD_SETTINGS["purge_dates"] = max(0, int(purge_dates))
+    label = "（舊做法：不清洗，可重現論文版）" if WALK_FORWARD_SETTINGS["purge_dates"] == 0 else ""
+    print(f"Walk-forward 清洗期：{WALK_FORWARD_SETTINGS['purge_dates']} 個交易日{label}")
+
+
+def get_walk_forward_purge() -> int:
+    return int(WALK_FORWARD_SETTINGS.get("purge_dates", 0))
+
+
 def build_walk_forward_splits_by_date(
     model_df: pd.DataFrame,
     n_splits: int = 8,
     min_train_dates: Optional[int] = None,
+    purge_dates: Optional[int] = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
+    purge = get_walk_forward_purge() if purge_dates is None else max(0, int(purge_dates))
     if "date" not in model_df.columns:
         return build_walk_forward_splits(len(model_df), n_splits=n_splits)
 
@@ -1373,7 +1399,10 @@ def build_walk_forward_splits_by_date(
         if test_start_pos >= len(unique_dates) or test_start_pos >= test_end_pos:
             continue
 
-        train_end_date = unique_dates.iloc[train_end_pos - 1]
+        train_last_pos = train_end_pos - 1 - purge
+        if train_last_pos < 0:
+            continue
+        train_end_date = unique_dates.iloc[train_last_pos]
         test_start_date = unique_dates.iloc[test_start_pos]
         test_end_date = unique_dates.iloc[test_end_pos - 1]
 

@@ -219,21 +219,53 @@ def format_bias_value(value, decimals: int = 2) -> str:
     return f"{numeric_value:.{decimals}f}%"
 
 
-FINAL_SCORE_WEIGHT_PROFILE = "low_model_weight_v1"
-FINAL_SCORE_WEIGHTS = {
-    "safety_score": 0.30,
-    "return_score": 0.20,
-    "rule_filter_score": 0.25,
-    "risk_reward_score": 0.25,
+# 最終決策分數的權重組合（2026-10-26 改為可切換；--score-profile 選擇）
+FINAL_SCORE_PROFILES = {
+    "low_model_weight_v1": {
+        "weights": {"safety_score": 0.30, "return_score": 0.20, "rule_filter_score": 0.25, "risk_reward_score": 0.25},
+        "explanation": (
+            "由於第一層模型在 walk-forward 驗證中未穩定優於 baseline，因此本系統降低模型分數權重，"
+            "並提高第二層規則式過濾與第三層風險報酬比之權重，使最終決策更偏向風險控管與交易可行性。"
+        ),
+    },
+    "rule_rr_v2": {
+        "weights": {"safety_score": 0.0, "return_score": 0.0, "rule_filter_score": 0.50, "risk_reward_score": 0.50},
+        "explanation": (
+            "2026-10-26 價格還原後的樣本外檢驗：安全分數主要反映低波動（安全分數最高的一組，後續 10 日報酬反而最低），"
+            "報酬模型樣本外 IC 約 0，兩者加入最終分數會拉低績效；因此最終分數改由第二層規則分數與第三層風險報酬分數各半組成。"
+            "模型分數保留為風險參考資訊，20 日報酬模型仍用於持倉的停利與移動停損管理。"
+        ),
+    },
 }
-FINAL_SCORE_FORMULA_TEXT = (
-    "final_decision_score = 0.30 * safety_score + 0.20 * return_score "
-    "+ 0.25 * rule_filter_score + 0.25 * risk_reward_score"
-)
-FINAL_SCORE_FORMULA_EXPLANATION = (
-    "由於第一層模型在 walk-forward 驗證中未穩定優於 baseline，因此本系統降低模型分數權重，"
-    "並提高第二層規則式過濾與第三層風險報酬比之權重，使最終決策更偏向風險控管與交易可行性。"
-)
+DEFAULT_FINAL_SCORE_PROFILE = "low_model_weight_v1"
+FINAL_SCORE_WEIGHT_PROFILE = DEFAULT_FINAL_SCORE_PROFILE
+FINAL_SCORE_WEIGHTS = dict(FINAL_SCORE_PROFILES[DEFAULT_FINAL_SCORE_PROFILE]["weights"])   # 原地更新，其他模組共用同一物件
+
+
+def _final_score_formula_text(weights: dict) -> str:
+    parts = [f"{weights[k]:.2f} * {k}" for k in ("safety_score", "return_score", "rule_filter_score", "risk_reward_score")
+             if weights.get(k, 0) > 0]
+    return "final_decision_score = " + " + ".join(parts)
+
+
+FINAL_SCORE_FORMULA_TEXT = _final_score_formula_text(FINAL_SCORE_WEIGHTS)
+FINAL_SCORE_FORMULA_EXPLANATION = FINAL_SCORE_PROFILES[DEFAULT_FINAL_SCORE_PROFILE]["explanation"]
+
+
+def set_final_score_profile(name: str) -> None:
+    global FINAL_SCORE_WEIGHT_PROFILE, FINAL_SCORE_FORMULA_TEXT, FINAL_SCORE_FORMULA_EXPLANATION
+    if name not in FINAL_SCORE_PROFILES:
+        raise ValueError(f"score profile 只能是 {', '.join(FINAL_SCORE_PROFILES)}")
+    FINAL_SCORE_WEIGHTS.clear()
+    FINAL_SCORE_WEIGHTS.update(FINAL_SCORE_PROFILES[name]["weights"])
+    FINAL_SCORE_WEIGHT_PROFILE = name
+    FINAL_SCORE_FORMULA_TEXT = _final_score_formula_text(FINAL_SCORE_WEIGHTS)
+    FINAL_SCORE_FORMULA_EXPLANATION = FINAL_SCORE_PROFILES[name]["explanation"]
+
+
+def get_final_score_profile_info() -> dict:
+    return {"profile": FINAL_SCORE_WEIGHT_PROFILE, "weights": dict(FINAL_SCORE_WEIGHTS),
+            "formula": FINAL_SCORE_FORMULA_TEXT, "explanation": FINAL_SCORE_FORMULA_EXPLANATION}
 MIN_PRACTICAL_STOP_PCT = 0.012
 MIN_PREFERRED_STOP_PCT = 0.015
 

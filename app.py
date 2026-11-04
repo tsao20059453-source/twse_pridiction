@@ -2341,19 +2341,15 @@ with tab_features:
     st.title("特徵解釋與決策依據")
     st.dataframe(feature_dataframe(), use_container_width=True, hide_index=True, height=520)
     st.markdown("#### 最終決策分數公式")
-    st.code(
-        """final_decision_score =
-0.30 * safety_score
-+ 0.20 * return_score
-+ 0.25 * rule_filter_score
-+ 0.25 * risk_reward_score""",
-        language="text",
-    )
-    st.markdown(
-        "由於第一層模型在 walk-forward 驗證中未穩定優於 baseline，"
-        "本系統降低模型分數權重，並提高規則式過濾與 Risk/Reward 權重，"
-        "使最終決策更偏向風險控管與交易可行性。"
-    )
+    try:
+        import pipeline_risk as _risk_mod
+        _profile = _risk_mod.get_final_score_profile_info()
+        st.code(_profile["formula"].replace(" + ", "\n+ ").replace("= ", "=\n"), language="text")
+        st.caption(f"權重組合：{_profile['profile']}")
+        st.markdown(_profile["explanation"])
+    except Exception:
+        st.code("final_decision_score =\n0.30 * safety_score\n+ 0.20 * return_score\n+ 0.25 * rule_filter_score\n+ 0.25 * risk_reward_score",
+                language="text")
 
 with tab_logs:
     st.title("執行紀錄與除錯資訊")

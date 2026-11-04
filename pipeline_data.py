@@ -36,7 +36,7 @@ import random
 import contextlib
 import sys
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -603,12 +603,262 @@ def fetch_twse_month_raw(stock_no: str, dt: datetime) -> pd.DataFrame:
     return pd.DataFrame(data["data"], columns=data["fields"])
 
 
+# ============================================================
+# 上櫃（TPEx）資料（2026-10-26 新增）
+# ------------------------------------------------------------
+# 個股歷史：FinMind TaiwanStockPrice（與 ETF 專案相同的資料集，上市上櫃皆可，一檔一次請求取得整段期間）。
+# 上櫃成交金額排行：櫃買中心 dailyQuotes（ETF 專案每日使用的端點）。
+# 市場判別：股票池檔案的 market 欄 → 本機快取檔名（TWSE_/TPEX_）→ data/cache/market_map.csv
+#           → FinMind TaiwanStockInfo（一次取得全部代號的上市／上櫃別）。都沒有時沿用預設市場。
+# 大盤過濾仍使用加權指數（TAIEX）。
+# ============================================================
+FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
+TPEX_DAILY_QUOTES_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
+SYMBOL_MARKET: dict = {}
+OTC_SETTINGS: dict = {"include_otc": False}
+
+
+def set_include_otc(enabled: bool = True) -> None:
+    OTC_SETTINGS["include_otc"] = bool(enabled)
+
+
+def _load_env_once() -> None:
+    if os.environ.get("_PIPELINE_ENV_LOADED"):
+        return
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    os.environ["_PIPELINE_ENV_LOADED"] = "1"
+
+
+def finmind_request(dataset: str, **params) -> pd.DataFrame:
+    """FinMind API（token 從 .env 的 FINMIND_TOKEN 讀取，不會印出）。"""
+    _load_env_once()
+    query = {"dataset": dataset, **{k: v for k, v in params.items() if v is not None}}
+    token = os.environ.get("FINMIND_TOKEN", "")
+    if token:
+        query["token"] = token
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = SESSION.get(FINMIND_API_URL, params=query, timeout=60)
+            payload = response.json()
+            status = payload.get("status")
+            if status == 402:
+                raise ValueError("FinMind 額度用完（未登入每小時 300 次），請稍後再試或在 .env 設定 FINMIND_TOKEN")
+            if status not in (200, None):
+                raise ValueError(f"FinMind 回傳 status={status}：{payload.get('msg')}")
+            return pd.DataFrame(payload.get("data", []))
+        except ValueError:
+            raise
+        except Exception as exc:                          # 網路錯誤：重試
+            last_error = exc
+            time.sleep(3 * attempt)
+    raise ValueError(f"FinMind 連線失敗：{last_error}")
+
+
+def fetch_finmind_price_range(stock_no: str, start_date: str, end_date: Optional[str] = None) -> pd.DataFrame:
+    """個股日線（FinMind，上市上櫃皆可），輸出欄位與證交所月資料標準化後相同。"""
+    raw = finmind_request("TaiwanStockPrice", data_id=stock_no, start_date=start_date, end_date=end_date)
+    if raw.empty:
+        return pd.DataFrame()
+    df = pd.DataFrame({
+        "date": pd.to_datetime(raw["date"], errors="coerce"),
+        "volume": pd.to_numeric(raw["Trading_Volume"], errors="coerce"),
+        "turnover": pd.to_numeric(raw["Trading_money"], errors="coerce"),
+        "open": pd.to_numeric(raw["open"], errors="coerce"),
+        "high": pd.to_numeric(raw["max"], errors="coerce"),
+        "low": pd.to_numeric(raw["min"], errors="coerce"),
+        "close": pd.to_numeric(raw["close"], errors="coerce"),
+        "change": pd.to_numeric(raw.get("spread"), errors="coerce"),
+        "transactions": pd.to_numeric(raw["Trading_turnover"], errors="coerce"),
+    })
+    for col in ("open", "high", "low", "close"):              # 無成交日 FinMind 給 0 價格，視為缺值並剔除
+        df.loc[df[col] <= 0, col] = np.nan
+    df = df.dropna(subset=["date", "close"])
+    df["volume_lots"] = df["volume"] / 1000
+    return df.sort_values("date").reset_index(drop=True)
+
+
+# ---- 股票名稱（2026-10-27）：顯示時一律寫成「名稱 代號」，例如「台積電 2330」 ----
+# 來源：data/cache/stock_names.csv（證交所＋櫃買中心收盤資料的代號與名稱）；查不到時（線上執行）
+# 再從 FinMind TaiwanStockInfo 補齊並寫回同一個檔案。
+NAME_SETTINGS: dict = {"allow_fetch": False}
+_NAME_CACHE: dict = {}
+
+
+def _stock_names_path() -> Path:
+    return Path(__file__).resolve().parent / "data" / "cache" / "stock_names.csv"
+
+
+def _load_stock_names() -> dict:
+    if "_loaded" not in _NAME_CACHE:
+        _NAME_CACHE["_loaded"] = True
+        _NAME_CACHE["names"], _NAME_CACHE["markets"] = {}, {}
+        path = _stock_names_path()
+        if path.exists():
+            try:
+                t = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+                _NAME_CACHE["names"] = dict(zip(t["symbol"].str.strip(), t["stock_name"].str.strip()))
+                if "market" in t.columns:
+                    _NAME_CACHE["markets"] = {k: v for k, v in zip(t["symbol"].str.strip(), t["market"].str.strip().str.upper()) if v}
+            except Exception as exc:
+                print(f"WARNING: 股票名稱對照表讀取失敗：{exc}")
+    return _NAME_CACHE["names"]
+
+
+def _save_stock_names(new_rows: dict, source: str) -> None:
+    path = _stock_names_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("") if path.exists() else \
+        pd.DataFrame(columns=["symbol", "stock_name", "market", "source"])
+    add = pd.DataFrame([{"symbol": k, "stock_name": n, "market": m, "source": source} for k, (n, m) in new_rows.items()])
+    merged = pd.concat([old, add], ignore_index=True).drop_duplicates("symbol", keep="last").sort_values("symbol")
+    merged.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def get_stock_name(symbol) -> str:
+    sym = str(symbol).strip()
+    names = _load_stock_names()
+    name = names.get(sym, "")
+    if not name and NAME_SETTINGS.get("allow_fetch") and not is_offline_as_of_mode() and not _NAME_CACHE.get("fetched"):
+        _NAME_CACHE["fetched"] = True
+        try:
+            refresh_market_map()
+            name = _load_stock_names().get(sym, "")
+        except Exception as exc:
+            print(f"WARNING: 無法取得股票名稱（{exc}）")
+    return name.rstrip("*").strip()
+
+
+def stock_label(symbol) -> str:
+    """「名稱 代號」，查不到名稱時只顯示代號。"""
+    sym = str(symbol).strip()
+    name = get_stock_name(sym)
+    return f"{name} {sym}" if name else sym
+
+
+def _market_map_path() -> Path:
+    return Path(__file__).resolve().parent / "data" / "cache" / "market_map.csv"
+
+
+def register_symbol_markets(mapping: dict) -> None:
+    for sym, mkt in (mapping or {}).items():
+        mkt = str(mkt).strip().upper()
+        if mkt in {"TWSE", "TPEX"}:
+            SYMBOL_MARKET[str(sym).strip()] = mkt
+
+
+def _read_market_map() -> dict:
+    path = _market_map_path()
+    if not path.exists():
+        return {}
+    try:
+        m = pd.read_csv(path, dtype=str)
+        return dict(zip(m["symbol"].str.strip(), m["market"].str.strip().str.upper()))
+    except Exception:
+        return {}
+
+
+def refresh_market_map() -> dict:
+    """FinMind TaiwanStockInfo：全部代號的上市（twse）／上櫃（tpex）別，存到 data/cache/market_map.csv。"""
+    info = finmind_request("TaiwanStockInfo")
+    if info.empty or "type" not in info.columns:
+        return {}
+    info = info[info["type"].isin(["twse", "tpex"])]
+    m = (info.assign(symbol=info["stock_id"].astype(str).str.strip(), market=info["type"].str.upper())
+             [["symbol", "market"]].drop_duplicates("symbol", keep="last"))
+    if "stock_name" in info.columns:                      # 同時補齊股票名稱對照表
+        try:
+            names = {str(r.stock_id).strip(): (str(r.stock_name).strip(), str(r.type).upper())
+                     for r in info.itertuples() if str(r.stock_id).strip()}
+            known = _load_stock_names()
+            _save_stock_names({k: v for k, v in names.items() if not known.get(k)}, "finmind")
+            _NAME_CACHE.pop("_loaded", None)
+        except Exception as exc:
+            print(f"WARNING: 股票名稱對照表更新失敗：{exc}")
+    path = _market_map_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    m.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"已更新上市／上櫃對照表：{path}（{len(m)} 檔）")
+    return dict(zip(m["symbol"], m["market"]))
+
+
+def lookup_symbol_market(stock_no: str, default: str = "TWSE") -> str:
+    sym = str(stock_no).strip()
+    if sym in SYMBOL_MARKET:
+        return SYMBOL_MARKET[sym]
+    twse_cache = get_raw_cache_path("TWSE", sym).exists()
+    tpex_cache = get_raw_cache_path("TPEX", sym).exists()
+    if twse_cache != tpex_cache:
+        SYMBOL_MARKET[sym] = "TWSE" if twse_cache else "TPEX"
+        return SYMBOL_MARKET[sym]
+    _load_stock_names()
+    if sym in _NAME_CACHE.get("markets", {}):               # 名稱對照表也記錄了上市／上櫃別
+        SYMBOL_MARKET[sym] = _NAME_CACHE["markets"][sym]
+        return SYMBOL_MARKET[sym]
+    mapping = _read_market_map()
+    if sym not in mapping and not is_offline_as_of_mode():
+        try:
+            mapping = refresh_market_map()
+        except Exception as exc:
+            print(f"WARNING: 無法判別 {sym} 的上市／上櫃別（{exc}），沿用 {default}")
+    if sym in mapping:
+        SYMBOL_MARKET[sym] = mapping[sym]
+        return mapping[sym]
+    return default.upper()
+
+
+def fetch_tpex_daily_quotes(target: datetime) -> pd.DataFrame:
+    """櫃買中心單日全部上櫃個股收盤（代號、名稱、成交金額）。查無資料（假日）回傳空表。"""
+    params = {"date": target.strftime("%Y/%m/%d"), "type": "EW", "response": "json"}
+    response = SESSION.get(TPEX_DAILY_QUOTES_URL, params=params, timeout=30, verify=False)
+    response.raise_for_status()
+    payload = response.json()
+    for table in payload.get("tables") or []:
+        fields = [str(f).strip() for f in table.get("fields", [])]
+        if {"代號", "名稱", "成交金額(元)"}.issubset(fields) and table.get("data"):
+            df = pd.DataFrame(table["data"], columns=fields)
+            return pd.DataFrame({
+                "symbol": df["代號"].astype(str).str.strip(),
+                "stock_name": df["名稱"].astype(str).str.strip(),
+                "today_turnover": pd.to_numeric(df["成交金額(元)"].astype(str).str.replace(",", ""), errors="coerce"),
+                "market": "TPEX",
+            })
+    return pd.DataFrame()
+
+
+def fetch_tpex_top_turnover_stocks(limit: int = 30, max_lookback_days: int = 7) -> pd.DataFrame:
+    today = datetime.today()
+    for back in range(max_lookback_days + 1):
+        day = today - timedelta(days=back)
+        if day.weekday() >= 5:
+            continue
+        try:
+            df = fetch_tpex_daily_quotes(day)
+        except Exception as exc:
+            print(f"櫃買中心 {day.date()} 收盤資料取得失敗：{exc}")
+            continue
+        if not df.empty:
+            df = df[df["symbol"].str.fullmatch(r"[1-9]\d{3}", na=False)].dropna(subset=["today_turnover"])
+            df = df[df["today_turnover"] > 0].sort_values("today_turnover", ascending=False).head(limit)
+            print(f"櫃買中心成交金額資料日期：{day.date()}")
+            return df.reset_index(drop=True)
+    return pd.DataFrame(columns=["symbol", "stock_name", "today_turnover", "market"])
+
+
 def fetch_month_data(stock_no: str, market: str, dt: datetime) -> pd.DataFrame:
     market = market.upper()
     if market == "TWSE":
         return fetch_twse_month_raw(stock_no, dt)
     if market == "TPEX":
-        raise NotImplementedError("TPEx 尚未接好資料源，本版請先使用 TWSE。")
+        start = dt.replace(day=1)
+        end = (pd.Timestamp(start) + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
+        return fetch_finmind_price_range(stock_no, start.strftime("%Y-%m-%d"), end)
     raise ValueError("market 只能是 TWSE 或 TPEX")
 
 
@@ -639,6 +889,67 @@ def fetch_twse_stock_day_all() -> pd.DataFrame:
             time.sleep(3)
 
     raise ValueError("TWSE OpenAPI 連線失敗，無法取得當日成交金額排行")
+
+
+# ============================================================
+# 可重現模式（2026-10-25 新增）
+#   --pool-csv：固定股票池，不再抓「執行當天」的成交金額排行
+#   --as-of   ：把指定日期視為「今天」——只用到這天為止的快取資料、
+#               不上網補資料、不寫回快取，近 N 年區間也以這天為基準
+#   兩個參數都不給時，行為與原本完全相同。
+# ============================================================
+REPRO_SETTINGS: dict = {"pool_csv": None, "as_of": None}
+
+
+def set_reproducible_mode(pool_csv: Optional[str] = None, as_of: Optional[str] = None) -> None:
+    REPRO_SETTINGS["pool_csv"] = None
+    REPRO_SETTINGS["as_of"] = None
+    if pool_csv:
+        pool_path = Path(pool_csv)
+        if not pool_path.exists():
+            raise FileNotFoundError(f"找不到固定股票池檔案：{pool_path}")
+        REPRO_SETTINGS["pool_csv"] = str(pool_path)
+    if as_of:
+        REPRO_SETTINGS["as_of"] = pd.Timestamp(str(as_of)[:10]).normalize()
+    if REPRO_SETTINGS["pool_csv"] or REPRO_SETTINGS["as_of"] is not None:
+        print("=" * 70)
+        print("可重現模式：開啟")
+        print(f"  固定股票池：{REPRO_SETTINGS['pool_csv'] or '（未指定，沿用當日成交金額排行）'}")
+        as_of_text = REPRO_SETTINGS['as_of'].strftime('%Y-%m-%d') if REPRO_SETTINGS['as_of'] is not None else '（未指定，以今天為準）'
+        print(f"  資料基準日：{as_of_text}")
+        if REPRO_SETTINGS["as_of"] is not None:
+            print("  僅使用本地快取：不上網補資料、不寫回快取")
+        print("=" * 70)
+
+
+def get_reference_today() -> pd.Timestamp:
+    """回傳程式視為「今天」的日期：可重現模式下為 --as-of，否則為系統日期。"""
+    if REPRO_SETTINGS.get("as_of") is not None:
+        return REPRO_SETTINGS["as_of"]
+    return pd.Timestamp(datetime.today().date())
+
+
+def is_offline_as_of_mode() -> bool:
+    return REPRO_SETTINGS.get("as_of") is not None
+
+
+def _clip_to_as_of(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "date" not in df.columns or not is_offline_as_of_mode():
+        return df
+    dates = pd.to_datetime(df["date"])
+    return df[dates <= REPRO_SETTINGS["as_of"]].copy()
+
+
+def read_fixed_stock_pool(limit: int) -> pd.DataFrame:
+    pool_path = Path(REPRO_SETTINGS["pool_csv"])
+    raw = pd.read_csv(pool_path, dtype={"symbol": str, "Code": str, "code": str})
+    stock_list = normalize_top_turnover_stock_list(raw, limit=limit)
+    if stock_list.empty:
+        raise ValueError(f"固定股票池檔案沒有可用的股票代碼：{pool_path}")
+    print(f"使用固定股票池：{pool_path}（{len(stock_list)} 檔）")
+    for idx, row in stock_list.iterrows():
+        print(f"{idx + 1:>2}. {row['stock_name']} {row['symbol']}")
+    return stock_list
 
 
 def get_twse_top_turnover_cache_path(limit: int) -> Path:
@@ -672,12 +983,20 @@ def normalize_top_turnover_stock_list(df: pd.DataFrame, limit: int) -> pd.DataFr
 
     work["symbol"] = work["symbol"].astype(str).str.strip()
     work["stock_name"] = work["stock_name"].fillna("").astype(str).str.strip()
+    names = _load_stock_names()                                     # 空白名稱以對照表補齊
+    empty = work["stock_name"].isin(["", "nan", "None"])
+    work.loc[empty, "stock_name"] = work.loc[empty, "symbol"].map(lambda s: names.get(s, "").rstrip("*"))
     work["today_turnover"] = pd.to_numeric(work["today_turnover"], errors="coerce")
     work = work[work["symbol"].str.fullmatch(r"[1-9]\d{3}", na=False)]
     work = work.drop_duplicates(subset=["symbol"], keep="first")
     if "today_turnover" in work.columns and work["today_turnover"].notna().any():
         work = work.sort_values("today_turnover", ascending=False, na_position="last")
-    return work.head(limit)[["symbol", "stock_name", "today_turnover"]].reset_index(drop=True)
+    cols = ["symbol", "stock_name", "today_turnover"]
+    if "market" in work.columns:                       # 含上櫃的股票池：保留並登記上市／上櫃別
+        work["market"] = work["market"].fillna("TWSE").astype(str).str.upper()
+        register_symbol_markets(dict(zip(work["symbol"], work["market"])))
+        cols.append("market")
+    return work.head(limit)[cols].reset_index(drop=True)
 
 
 def write_twse_top_turnover_cache(stock_list: pd.DataFrame, limit: int, source_date=None) -> Path:
@@ -728,6 +1047,10 @@ def read_latest_ranking_symbols_as_stock_list(limit: int) -> pd.DataFrame:
 
 
 def fetch_twse_top_turnover_stocks(limit: int = 30) -> pd.DataFrame:
+    if REPRO_SETTINGS.get("pool_csv"):
+        return read_fixed_stock_pool(limit=limit)
+    if OTC_SETTINGS.get("include_otc"):
+        return fetch_combined_top_turnover_stocks(limit=limit)
     print(f"抓取 TWSE 當日成交金額排行前 {limit} 檔...")
     try:
         df = fetch_twse_stock_day_all()
@@ -762,7 +1085,7 @@ def fetch_twse_top_turnover_stocks(limit: int = 30) -> pd.DataFrame:
 
         print("今日成交金額排行：")
         for idx, row in work.iterrows():
-            print(f"{idx + 1:>2}. {row['symbol']} {row['stock_name']} 成交金額 {int(row['today_turnover']):,}")
+            print(f"{idx + 1:>2}. {row['stock_name']} {row['symbol']} 成交金額 {int(row['today_turnover']):,}")
 
         return work
     except Exception as exc:
@@ -779,6 +1102,34 @@ def fetch_twse_top_turnover_stocks(limit: int = 30) -> pd.DataFrame:
         return ranking_stock_list
 
     raise ValueError("無法取得成交金額排行，且沒有可用快取；請先執行一次 predict 或檢查網路連線。")
+
+
+def fetch_combined_top_turnover_stocks(limit: int = 30) -> pd.DataFrame:
+    """上市＋上櫃合併，依當日成交金額取前 N 檔（--include-otc）。"""
+    OTC_SETTINGS["include_otc"] = False                  # 避免遞迴：先取上市排行
+    try:
+        twse = fetch_twse_top_turnover_stocks(limit=limit).copy()
+    finally:
+        OTC_SETTINGS["include_otc"] = True
+    twse["market"] = "TWSE"
+    print(f"抓取櫃買中心當日成交金額排行前 {limit} 檔...")
+    tpex = fetch_tpex_top_turnover_stocks(limit=limit)
+    if tpex.empty:
+        print("WARNING: 櫃買中心資料取得失敗，本次只使用上市股票")
+    combined = pd.concat([twse, tpex], ignore_index=True)
+    combined = combined.sort_values("today_turnover", ascending=False).drop_duplicates("symbol").head(limit)
+    combined = combined.reset_index(drop=True)
+    register_symbol_markets(dict(zip(combined["symbol"], combined["market"])))
+    cache_dir = TOP_TURNOVER_CACHE_DIR
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"twse_tpex_top_turnover_{limit}_{datetime.today().strftime('%Y%m%d')}.csv"
+    combined.to_csv(path, index=False, encoding="utf-8-sig")
+    print("上市＋上櫃成交金額排行：")
+    for idx, row in combined.iterrows():
+        tag = "上櫃" if row["market"] == "TPEX" else "上市"
+        print(f"{idx + 1:>2}. {row['stock_name']} {row['symbol']}（{tag}）成交金額 {int(row['today_turnover']):,}")
+    print(f"已存成股票池檔案（可用 --pool-csv 重現）：{path}")
+    return combined
 
 
 def fetch_twse_top_volume_stocks(limit: int = 30) -> pd.DataFrame:
@@ -846,10 +1197,97 @@ def write_raw_cache(df: pd.DataFrame, cache_path: Path) -> None:
     out.to_csv(cache_path, index=False, encoding="utf-8-sig")
 
 
+# ============================================================
+# 除權、面額變更、減資的價格還原（2026-10-26 新增）
+# ------------------------------------------------------------
+# 證交所提供的是未還原價格。台股漲跌幅 10%，單日變動超過 ±10.5% 必定是公司行為
+# （面額變更／股票分割、大額配股、減資），例如 2327 國巨 2025-08-25 一拆四（546 → 143）、
+# 6669 緯穎 2026-09-02 除權一張變三張（7800 → 2610）。不還原時，回測會把持有部位記成
+# 單日虧損 70% 以上，技術指標也會出現假訊號。
+# 做法（同 ETF 專案 esun/data/adjust.py 的公司行為推估）：
+#   f_t = 當日開盤 / 前一日收盤（假設參考價 ≈ 開盤價，誤差約為一般的隔夜跳空）
+#   向後還原：adj_price(s) = price(s) × Π_{t>s} f_t，最新價格不變；成交量同步除以該倍數。
+# 現金股利與小額配股（缺口 < 10%）：data/chip/dividends.csv 有資料時，以 f = 除權息參考價 / 前一日收盤 還原
+#   （FinMind 除權息結果，同 ETF 專案）；先套用除權息，剩下仍超過 ±10.5% 的才用開盤價推估。
+# ============================================================
+PRICE_ADJUST_SETTINGS: dict = {"enabled": True}
+PRICE_LIMIT_TOLERANCE = 0.105
+_DIVIDEND_CACHE: dict = {}
+
+
+def _dividend_factors(symbol: str) -> pd.Series:
+    """回傳 {除權息日: 調整因子}；沒有資料時為空。"""
+    if "table" not in _DIVIDEND_CACHE:
+        path = Path(__file__).resolve().parent / "data" / "chip" / "dividends.csv"
+        table = pd.DataFrame()
+        if path.exists():
+            table = pd.read_csv(path, dtype={"code": str}, encoding="utf-8-sig")
+            table["date"] = pd.to_datetime(table["date"], errors="coerce")
+            table["f"] = pd.to_numeric(table["after_price"], errors="coerce") / pd.to_numeric(table["before_price"], errors="coerce")
+            table = table[(table["f"] > 0.2) & (table["f"] <= 1.0)]
+        _DIVIDEND_CACHE["table"] = table
+    table = _DIVIDEND_CACHE["table"]
+    if table.empty:
+        return pd.Series(dtype=float)
+    sub = table[table["code"] == str(symbol)]
+    return sub.groupby("date")["f"].prod()
+
+
+def set_price_adjust(enabled: bool = True) -> None:
+    PRICE_ADJUST_SETTINGS["enabled"] = bool(enabled)
+
+
+def _adjust_one_symbol(g: pd.DataFrame, verbose: bool) -> pd.DataFrame:
+    g = g.sort_values("date").reset_index(drop=True).copy()
+    close = pd.to_numeric(g["close"], errors="coerce")
+    open_ = pd.to_numeric(g["open"], errors="coerce")
+    prev = close.shift(1)
+    sym = str(g["symbol"].iloc[0]) if "symbol" in g.columns else ""
+    f_div = pd.to_datetime(g["date"]).map(_dividend_factors(sym)).astype(float).fillna(1.0)
+    f_div.index = g.index
+    jump = (close / (prev * f_div) - 1).abs() > PRICE_LIMIT_TOLERANCE      # 除權息後仍超過漲跌幅 → 面額變更／減資等
+    event = jump & prev.notna() & (prev > 0) & open_.notna() & (open_ > 0)
+    f = np.where(event, (open_ / prev).clip(0.05, 20.0), f_div)
+    f = pd.Series(f, index=g.index).fillna(1.0)
+    after = f.iloc[::-1].cumprod().iloc[::-1] / f            # Π_{t>s} f_t
+    g["adj_factor"] = after.astype(float)
+    g["corporate_action_flag"] = event.astype(bool)
+    g["is_ex_dividend_date"] = (f_div < 1.0) & ~event
+    if not (event.any() or (f_div < 1.0).any()):
+        return g
+    for col in ("open", "high", "low", "close"):
+        if col in g.columns:
+            g[col] = pd.to_numeric(g[col], errors="coerce") * g["adj_factor"]
+    for col in ("volume", "volume_lots"):
+        if col in g.columns:
+            g[col] = pd.to_numeric(g[col], errors="coerce") / g["adj_factor"]
+    if verbose:
+        n_div = int(g["is_ex_dividend_date"].sum())
+        if n_div:
+            print(f"[價格還原] {sym} 套用除權息 {n_div} 次（FinMind 除權息參考價）")
+        for i in np.flatnonzero(event.to_numpy()):
+            print(f"[價格還原] {sym} {pd.Timestamp(g.loc[i, 'date']).date()} 單日 {prev.iloc[i]:.2f} → {close.iloc[i]:.2f}"
+                  f"（超過漲跌幅，視為除權／面額變更），之前價格 × {f.iloc[i]:.4f}")
+    return g
+
+
+def adjust_for_corporate_actions(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """個股價量資料的公司行為還原；大盤指數（沒有 open 欄位）或關閉時原樣回傳。"""
+    if (df is None or df.empty or not PRICE_ADJUST_SETTINGS["enabled"]
+            or not {"date", "open", "close"}.issubset(df.columns)):
+        return df
+    if "symbol" in df.columns and df["symbol"].nunique() > 1:
+        parts = [_adjust_one_symbol(g, verbose) for _, g in df.groupby("symbol", sort=False)]
+        return pd.concat(parts, ignore_index=True)
+    return _adjust_one_symbol(df, verbose)
+
+
 def filter_to_recent_years(df: pd.DataFrame, years: int) -> pd.DataFrame:
     if df.empty or "date" not in df.columns:
         return df
-    cutoff = pd.Timestamp(datetime.today().date()) - pd.DateOffset(years=years)
+    df = _clip_to_as_of(df)
+    df = adjust_for_corporate_actions(df)          # 先截到資料基準日再還原，不使用基準日之後的公司行為
+    cutoff = get_reference_today() - pd.DateOffset(years=years)
     return df[df["date"] >= cutoff].sort_values("date").reset_index(drop=True)
 
 
@@ -863,6 +1301,27 @@ def fetch_trading_data_months(
 ) -> pd.DataFrame:
     today = datetime.today()
     monthly_frames: list[pd.DataFrame] = []
+
+    if market.upper() == "TPEX":
+        # 上櫃：FinMind 一次請求取得整段期間（避免逐月請求耗用額度）
+        base = start_from_month or today
+        start = shift_month(base, max(months_to_fetch - 1, 0))
+        if only_after_date is not None:
+            start = max(start, (pd.Timestamp(only_after_date) + pd.Timedelta(days=1)).to_pydatetime())
+        end = (pd.Timestamp(base.replace(day=1)) + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
+        try:
+            df = fetch_finmind_price_range(stock_no, start.strftime("%Y-%m-%d"), end)
+        except Exception as e:
+            print(f"上櫃股票 {stock_no} 抓取失敗：{e}")
+            return pd.DataFrame()
+        if only_after_date is not None and not df.empty:
+            df = df[df["date"] > pd.Timestamp(only_after_date)]
+        if df.empty:
+            return pd.DataFrame()
+        df["symbol"] = stock_no
+        df["market"] = "TPEX"
+        print(f"成功抓取上櫃 {stock_no} {start.strftime('%Y-%m-%d')} ~ {end}，新增筆數：{len(df)}")
+        return clean_price_dataframe(df)
 
     for i in range(months_to_fetch):
         target_month = shift_month(start_from_month or today, i)
@@ -888,6 +1347,10 @@ def fetch_trading_data_months(
 
 def get_last_n_years_trading_data(config: PipelineConfig) -> pd.DataFrame:
     validate_inputs(config.stock_no, config.market)
+    market = lookup_symbol_market(config.stock_no, config.market)
+    if market != config.market.upper():
+        print(f"{config.stock_no} 為{'上櫃' if market == 'TPEX' else '上市'}股票，改用 {market} 資料")
+        config = replace(config, market=market)
 
     cache_path = get_raw_cache_path(config.market, config.stock_no)
     months_to_fetch = config.years * 12
@@ -905,6 +1368,12 @@ def get_last_n_years_trading_data(config: PipelineConfig) -> pd.DataFrame:
         else:
             last_date = pd.to_datetime(cached_df["date"]).max()
             print(f"本地資料最後日期：{last_date.strftime('%Y-%m-%d')}")
+            if is_offline_as_of_mode():
+                as_of = REPRO_SETTINGS["as_of"]
+                if last_date < as_of - pd.Timedelta(days=7):
+                    print(f"WARNING: {config.stock_no} 快取只到 {last_date.date()}，早於資料基準日 {as_of.date()}（可重現模式不會上網補資料）")
+                print(f"[可重現模式] {config.stock_no} 只使用快取，截至 {as_of.date()}")
+                return filter_to_recent_years(cached_df, config.years)
             if last_date == pd.Timestamp.today().normalize():
                 print(f'[CACHE HIT] {config.stock_no} 今日資料已是最新，跳過網路請求')
                 return filter_to_recent_years(cached_df, config.years)
@@ -937,6 +1406,12 @@ def get_last_n_years_trading_data(config: PipelineConfig) -> pd.DataFrame:
         write_raw_cache(combined_df, cache_path)
         print(f"更新後總資料筆數：{len(combined_df)}")
         return filter_to_recent_years(combined_df, config.years)
+
+    if is_offline_as_of_mode():
+        raise FileNotFoundError(
+            f"可重現模式找不到 {config.stock_no} 的本地快取：{cache_path}。"
+            "請先在一般模式（不加 --as-of）執行一次以建立快取。"
+        )
 
     print("\n找不到本地快取，開始抓完整歷史資料：")
     print(cache_path)
@@ -1106,6 +1581,13 @@ def get_market_index_data(config: PipelineConfig) -> pd.DataFrame:
         except Exception as e:
             print(f"WARNING: failed to read market index cache {cache_path}: {e}")
 
+    if is_offline_as_of_mode():
+        if cached_df.empty:
+            print("WARNING: 可重現模式找不到大盤指數快取；market environment features will be NaN")
+            return cached_df
+        print(f"[可重現模式] {config.market}_INDEX 只使用快取，截至 {REPRO_SETTINGS['as_of'].date()}")
+        return filter_to_recent_years(standardize_market_index_data(cached_df), config.years)
+
     try:
         if cached_df.empty:
             new_df = fetch_market_index_months(
@@ -1163,6 +1645,7 @@ def get_historical_trading_data(
     burn_in_months 讓 RSI14/MACD/ATR/BIAS 在 start_date 前有足夠 lookback。
     """
     validate_inputs(config.stock_no, config.market)
+    config = replace(config, market=lookup_symbol_market(config.stock_no, config.market))
     start_dt = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
     end_dt   = datetime.strptime(str(end_date)[:10],   "%Y-%m-%d")
     fetch_start = shift_month(start_dt, burn_in_months)
@@ -1191,7 +1674,7 @@ def get_historical_trading_data(
     df["market"] = config.market.upper()
     end_ts = pd.Timestamp(end_dt)
     df = df[df["date"] <= end_ts].sort_values("date").reset_index(drop=True)
-    return df
+    return adjust_for_corporate_actions(df)
 
 
 def get_historical_market_index_data(

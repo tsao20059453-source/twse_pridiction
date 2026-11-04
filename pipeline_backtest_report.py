@@ -1422,6 +1422,16 @@ def run_backtest_mode(
         print()
         print_portfolio_report(metrics, equity_curve, bt_config, investor_mode=investor_mode)
 
+        # 回測最後一日的系統決策 → AI 分析師解讀（2026-10-27）
+        try:
+            from pipeline_ai import AI_SETTINGS, maybe_run_ai_analyst
+            if AI_SETTINGS.get("enabled") and not oos_df.empty:
+                _last = oos_df.sort_values("date").iloc[-1]
+                maybe_run_ai_analyst(_last, bt_config, None,
+                                     title=f"十二、AI 分析師解讀（{single_symbol} 回測最後一日 {str(_last.get('date'))[:10]} 的系統決策）")
+        except Exception as exc:
+            print(f"[AI] 分析師報告產生失敗（不影響回測結果）：{exc}")
+
         if not trade_log.empty:
             print("\n交易明細（Portfolio execution engine）：")
             display_cols = [c for c in [
@@ -1446,7 +1456,7 @@ def run_backtest_mode(
         output_dir = Path(bt_config.output_dir)
         output_dir.mkdir(exist_ok=True)
         ts = datetime.today().strftime("%Y%m%d_%H%M%S")
-        prefix = output_dir / f"{bt_config.market.upper()}_{single_symbol}_portfolio_backtest_{bt_config.backtest_profile_name}_{ts}"
+        prefix = output_dir / f"{lookup_symbol_market(single_symbol, bt_config.market)}_{single_symbol}_portfolio_backtest_{bt_config.backtest_profile_name}_{ts}"
         if not trade_log.empty:
             tl_csv = Path(f"{prefix}_trade_log.csv")
             tl_xlsx = Path(f"{prefix}_trade_log.xlsx")
@@ -1483,7 +1493,7 @@ def run_backtest_mode(
             try:
                 tl, ec = run_backtest(sym_oos, sym_config, mode="single", investor_mode=investor_mode)
             except Exception as exc:
-                print(f"  [{i}/{len(bt_symbols)}] {sym} 回測失敗：{exc}")
+                print(f"  [{i}/{len(bt_symbols)}] {stock_label(sym)} 回測失敗：{exc}")
                 continue
 
             if not tl.empty:
@@ -1546,6 +1556,7 @@ def run_backtest_mode(
             })
             per_symbol_rows.append({
                 "股票代碼":          sym,
+                "名稱":              get_stock_name(sym),
                 "總報酬":            _fp(m.get("total_return")),
                 "勝率":              _fp(m.get("win_rate")),
                 "交易筆數":          m.get("total_trades", 0),
@@ -1568,7 +1579,7 @@ def run_backtest_mode(
             n_trades  = len(tl)
             total_ret = m.get("total_return", 0)
             if not investor_mode or i % 10 == 0 or i == len(bt_symbols):
-                print(f"  [{i}/{len(bt_symbols)}] {sym}：{n_trades} 筆交易，總報酬 {total_ret:.1%}")
+                print(f"  [{i}/{len(bt_symbols)}] {stock_label(sym)}：{n_trades} 筆交易，總報酬 {total_ret:.1%}")
 
         # 合併交易紀錄
         combined_log = pd.concat(all_trade_logs, ignore_index=True) if all_trade_logs else pd.DataFrame()
@@ -1736,7 +1747,7 @@ def run_backtest_mode(
                     tr_s = f"{tr:.1%}" if pd.notna(tr) else "N/A"
                     wr_s = f"{wr:.1%}" if pd.notna(wr) else "N/A"
                     ev_s = f"{ev:.2%}" if pd.notna(ev) else "N/A"
-                    print(f"  {r['symbol']}  總報酬 {tr_s}  勝率 {wr_s}  {nt} 筆  {extra_label} {ev_s}")
+                    print(f"  {stock_label(r['symbol'])}  總報酬 {tr_s}  勝率 {wr_s}  {nt} 筆  {extra_label} {ev_s}")
 
             print()
             print("表現最好前 5 支（依總報酬率）：")
@@ -1872,6 +1883,18 @@ def run_backtest_mode(
         if benchmark_metrics:
             print()
             print_strategy_vs_benchmark_report(pf_metrics, benchmark_metrics)
+
+        # 回測最後一日的候選股決策總表 → AI 分析師解讀（2026-10-27）
+        try:
+            if "date" in oos_df.columns and "final_decision_score" in oos_df.columns:
+                _last_date = pd.to_datetime(oos_df["date"]).max()
+                _last_rows = oos_df[pd.to_datetime(oos_df["date"]) == _last_date].copy()
+                print_full_decision_table(
+                    _last_rows, f"十一、回測最後一日（{_last_date.date()}）各股系統決策（依最終分數排序）")
+                from pipeline_ai import run_ai_for_rows
+                run_ai_for_rows(_last_rows, config, title_prefix="十二、AI 分析師解讀（回測最後一日候選股）", max_n=3)
+        except Exception as exc:
+            print(f"[AI] 最後一日決策解讀產生失敗（不影響回測結果）：{exc}")
 
         if run_profile_experiments:
             try:

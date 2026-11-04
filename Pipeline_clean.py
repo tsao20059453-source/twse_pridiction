@@ -218,6 +218,16 @@ def run_sensitivity_analysis(config: "PipelineConfig", top_n: int = 30) -> None:
         print(summary_df.to_string(index=False))
 
 
+def _has_anthropic_key() -> bool:
+    import os
+    try:
+        from pipeline_ai import ROOT_DIR, load_env_file
+        load_env_file(ROOT_DIR / ".env")
+    except Exception:
+        pass
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument(
@@ -283,7 +293,73 @@ def main() -> None:
         default=None,
         help="只輸出投資人摘要；--no-investor-mode 強制顯示完整診斷",
     )
+    parser.add_argument(
+        "--pool-csv",
+        default=None,
+        help="可重現模式：固定股票池 CSV（需含 symbol 欄位），不再抓執行當天的成交金額排行",
+    )
+    parser.add_argument(
+        "--as-of",
+        default=None,
+        help="可重現模式：資料基準日 YYYY-MM-DD，只用到這天的本地快取，不上網、不寫回快取",
+    )
+    parser.add_argument(
+        "--purge-days",
+        type=int,
+        default=None,
+        help="walk-forward 清洗期（交易日），預設 10；設 0 可重現 2026-09-21 論文版（舊做法）",
+    )
+    parser.add_argument(
+        "--score-profile",
+        default=None,
+        choices=["low_model_weight_v1", "rule_rr_v2"],
+        help="最終決策分數權重：low_model_weight_v1＝論文版（0.30 安全＋0.20 報酬＋0.25 規則＋0.25 風險報酬）；"
+             "rule_rr_v2＝規則與風險報酬各 0.5（2026-10-26 新增）",
+    )
+    parser.add_argument(
+        "--include-otc",
+        action="store_true",
+        help="股票池納入上櫃股票：上市＋上櫃合併依當日成交金額取前 N 檔（個股分析會自動判別上市／上櫃，不需此參數）",
+    )
+    parser.add_argument(
+        "--chip-features",
+        action="store_true",
+        help="模型加入三大法人、融資融券、月營收特徵（資料在 data/chip/，以 tools/fetch_chip_data.py 取得）",
+    )
+    parser.add_argument(
+        "--no-price-adjust",
+        action="store_true",
+        help="不做除權／面額變更價格還原（重現 2026-10-26 以前的結果時使用）",
+    )
+    parser.add_argument("--agent", default=None, metavar="問題",
+                        help='AI 決策代理：用一句話提問，例如 --agent "2330 現在可以買嗎？有沒有更好的選擇？"')
+    parser.add_argument("--agent-dry-run", action="store_true", help="決策代理不呼叫 API，改用固定流程與確定性範本")
+    parser.add_argument("--ai-report", action="store_true",
+                        help="第十二段 AI 分析師解讀（Claude 撰寫＋Critic 稽核；不改變任何決策）")
+    parser.add_argument("--ai-model", default=None, help="AI 分析師使用的模型，預設 claude-sonnet-5-5")
+    parser.add_argument("--ai-dry-run", action="store_true",
+                        help="AI 分析師報告不呼叫 API，只用確定性範本，並把 prompt 存進輸出 JSON")
     args, _ = parser.parse_known_args()
+    set_reproducible_mode(pool_csv=args.pool_csv, as_of=args.as_of)
+    set_price_adjust(not args.no_price_adjust)
+    NAME_SETTINGS["allow_fetch"] = True          # 名稱查不到時可從 FinMind 補齊（可重現模式下不會上網）
+    if args.include_otc:
+        set_include_otc(True)
+    if args.chip_features:
+        from pipeline_chip import set_chip_features
+        set_chip_features(True)
+    if args.score_profile:
+        set_final_score_profile(args.score_profile)
+    if args.ai_report or args.ai_dry_run:
+        from pipeline_ai import set_ai_mode
+        set_ai_mode(enabled=args.ai_report, model=args.ai_model, dry_run=args.ai_dry_run)
+    if args.purge_days is not None:
+        set_walk_forward_purge(args.purge_days)
+    if args.agent:
+        from pipeline_agent import run_agent_cli
+        run_agent_cli(args.agent, CONFIG, symbol=args.symbol, top_n=30,
+                      dry_run=args.agent_dry_run, model=args.ai_model)
+        return
 
     direct_run = len(sys.argv) == 1
     symbols_for_training: list[str] | None = None
@@ -297,7 +373,16 @@ def main() -> None:
         print("1. 個股深度分析（輸入任意股票代碼，輸出完整個股決策報告）")
         print("2. 多股票排名分析（依成交金額 Top N 建立共同模型並輸出排名）")
         print("3. 回測分析（對指定股票或 Top N 進行歷史回測）")
-        mode_choice = input("請輸入 1、2 或 3，預設 1：").strip()
+        print("4. AI 決策代理（用一句話提問，例如「2330 現在可以買嗎？有沒有更好的選擇？」）")
+        mode_choice = input("請輸入 1、2、3 或 4，預設 1：").strip()
+        if mode_choice == "4":
+            question = input("請輸入你的問題：").strip() or "2330 現在可以買嗎？有沒有更好的選擇？"
+            has_key = _has_anthropic_key()
+            if not has_key:
+                print("找不到 ANTHROPIC_API_KEY，改用固定流程（不呼叫 API）。")
+            from pipeline_agent import run_agent_cli
+            run_agent_cli(question, CONFIG, top_n=30, dry_run=not has_key, model=args.ai_model)
+            return
         args.diagnostic_scope = "common"
         args.feature_set = "selected_v2"
         args.model_type = "extra_trees"
@@ -315,7 +400,7 @@ def main() -> None:
 
         print("請選擇市場：")
         print("1. TWSE 上市")
-        print("2. TPEX 上櫃")
+        print("2. TPEX 上櫃（個股會自動判別上市／上櫃；Top N 會改為上市＋上櫃合併排行）")
         market_choice = input("請輸入 1 或 2，預設 1：").strip()
         args.market = "TPEX" if market_choice == "2" else "TWSE"
 
@@ -330,7 +415,7 @@ def main() -> None:
                 backtest_symbol = None
                 args.symbol = "ALL"
                 args.top_n = backtest_top_n
-                print(f"本次將對 {args.market} 成交金額 Top {backtest_top_n} 股票進行批次回測。")
+                print(f"本次將對{'上市＋上櫃' if args.market == 'TPEX' else '上市'}成交金額 Top {backtest_top_n} 股票進行批次回測。")
             else:
                 user_sym = input("請輸入要回測的股票代碼，例如 2330：").strip()
                 backtest_symbol = user_sym if user_sym else "2330"
@@ -346,7 +431,22 @@ def main() -> None:
             args.top_n = parse_interactive_top_n(top_n_text)
             args.symbol = "ALL"
             symbols_for_training = None
-            print(f"本次將以 {args.market} 成交金額 Top {args.top_n} 股票建立共同決策模型。")
+            print(f"本次將以{'上市＋上櫃' if args.market == 'TPEX' else '上市'}成交金額 Top {args.top_n} 股票建立共同決策模型。")
+
+        # AI 分析師（2026-10-27）：每條選單路徑都可產生
+        has_key = _has_anthropic_key()
+        print("是否產生 AI 分析師解讀？")
+        print("1. 是，由 Claude 撰寫（需要 .env 的 ANTHROPIC_API_KEY，會產生少量 API 費用）")
+        print("2. 是，使用確定性範本（不呼叫 API、不花費）")
+        print("3. 否")
+        default_ai = "1" if has_key else "2"
+        ai_choice = input(f"請輸入 1、2 或 3，預設 {default_ai}：").strip() or default_ai
+        if ai_choice == "1" and not has_key:
+            print("找不到 ANTHROPIC_API_KEY，改用確定性範本。")
+            ai_choice = "2"
+        if ai_choice in ("1", "2"):
+            from pipeline_ai import set_ai_mode
+            set_ai_mode(enabled=True, model=args.ai_model, dry_run=(ai_choice == "2"))
 
     if False and direct_run:
         print("請選擇分析模式：")
@@ -463,6 +563,20 @@ def main() -> None:
         skip_classification=args.skip_classification,
         display_mode=args.display_mode,
     )
+
+    # 上櫃（2026-10-27）：市場選 TPEX 時，股票池與大盤指數仍以上市為基礎；
+    # 個股自動判別上市／上櫃（判別不出時視為上櫃），Top N 則改為上市＋上櫃合併排行。
+    if config.market.upper() == "TPEX":
+        from dataclasses import replace as _replace
+        sym = str(config.stock_no).strip()
+        if sym and sym.upper() not in {"ALL", "*", "全部", "CUSTOM"}:
+            mkt = lookup_symbol_market(sym, "TPEX")
+            register_symbol_markets({sym: mkt})
+            print(f"{sym} 判別為{'上櫃' if mkt == 'TPEX' else '上市'}股票；共同模型股票池沿用成交金額排行，大盤過濾使用加權指數。")
+        else:
+            set_include_otc(True)
+            print("股票池改為上市＋上櫃合併，依當日成交金額排行。")
+        config = _replace(config, market="TWSE")
 
     if args.mode == "target_compare":
         if args.input_data:

@@ -362,9 +362,11 @@ def print_presentation_model_settings(config: PipelineConfig, top_n: Optional[in
     print("- combined_decision_score = 0.65 * safety_score + 0.35 * return_score")
     print()
     print("最終決策分數公式：")
-    print(f"- {FINAL_SCORE_FORMULA_TEXT}")
-    print(f"- final_score_weight_profile：{FINAL_SCORE_WEIGHT_PROFILE}")
-    print(f"- 公式說明：{FINAL_SCORE_FORMULA_EXPLANATION}")
+    import pipeline_risk as _risk_mod
+    _profile = _risk_mod.get_final_score_profile_info()
+    print(f"- {_profile['formula']}")
+    print(f"- final_score_weight_profile：{_profile['profile']}")
+    print(f"- 公式說明：{_profile['explanation']}")
     print()
 
 
@@ -532,7 +534,7 @@ def print_final_investment_decision(output_df: pd.DataFrame, config: PipelineCon
     print("未來第 10 個交易日投資決策建議")
     print("=" * 70)
     print()
-    print(f"股票代碼：{symbol}")
+    print(f"股票：{stock_label(symbol)}")
     print(f"市場：{market}")
     print(f"資料蒐集截止日：{date_text}")
     print(f"最新收盤價：{close_text}")
@@ -801,6 +803,12 @@ def print_final_investment_decision(output_df: pd.DataFrame, config: PipelineCon
     print("-" * 70)
     print("本系統為投資決策支援工具，並非保證獲利模型。")
     print("模型結果應搭配基本面、籌碼面、市場環境與個人風險承受度共同判斷。")
+    # 第十二段：AI 分析師解讀（只在加上 --ai-report 時執行；不改變任何數字或決策）
+    try:
+        from pipeline_ai import maybe_run_ai_analyst
+        maybe_run_ai_analyst(latest_row, config, summary)
+    except Exception as exc:
+        print(f"[AI] 分析師報告產生失敗（不影響上方決策）：{exc}")
 
 
 def build_single_diagnostic_summary(diagnostic_df: pd.DataFrame, config: PipelineConfig) -> tuple[dict, pd.DataFrame]:
@@ -1685,7 +1693,7 @@ def run_single_stock_diagnostic(config: PipelineConfig, top_n: int = 30, investo
 
     timestamp = datetime.today().strftime("%Y%m%d_%H%M%S")
     file_prefix = OUTPUT_DIR / (
-        f"{config.market.upper()}_{config.stock_no}_{config.diagnostic_scope}_single_diagnostic_{timestamp}"
+        f"{lookup_symbol_market(config.stock_no, config.market)}_{config.stock_no}_{config.diagnostic_scope}_single_diagnostic_{timestamp}"
     )
     csv_path = Path(f"{file_prefix}.csv")
     xlsx_path = Path(f"{file_prefix}.xlsx")
@@ -2231,7 +2239,7 @@ def run_dual_model_diagnostic(config: PipelineConfig, top_n: int = 30) -> tuple[
 
     timestamp = datetime.today().strftime("%Y%m%d_%H%M%S")
     file_prefix = OUTPUT_DIR / (
-        f"{dual_config.market.upper()}_{dual_config.stock_no}_{dual_config.diagnostic_scope}_dual_diagnostic_{timestamp}"
+        f"{lookup_symbol_market(dual_config.stock_no, dual_config.market)}_{dual_config.stock_no}_{dual_config.diagnostic_scope}_dual_diagnostic_{timestamp}"
     )
     csv_path = Path(f"{file_prefix}.csv")
     xlsx_path = Path(f"{file_prefix}.xlsx")
@@ -3022,7 +3030,7 @@ def print_latest_report(df: pd.DataFrame, metrics: dict, config: PipelineConfig)
     print("\n" + "=" * 70)
     print("股票機器學習投資價值預測結果")
     print("=" * 70)
-    print(f"股票代碼：{latest.get('symbol', config.stock_no)}")
+    print(f"股票：{stock_label(latest.get('symbol', config.stock_no))}")
     print(f"市場：{latest.get('market', config.market)}")
     print(f"資料蒐集截止日：{latest_date.strftime('%Y-%m-%d')}")
     print(f"最新收盤價：{latest['close']:.2f}")
@@ -3240,7 +3248,8 @@ def add_cross_sectional_rank_features(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = pd.to_numeric(out[col], errors="coerce")
         out[f"{col}_cs_rank"] = out.groupby("date")[col].rank(pct=True)
 
-    return out
+    from pipeline_chip import add_chip_cs_ranks
+    return add_chip_cs_ranks(out)
 
 
 def add_cross_sectional_amount_features(combined_df: pd.DataFrame) -> pd.DataFrame:
@@ -3923,6 +3932,10 @@ def build_shared_common_stock_pool(
         stock_list = stock_list.copy()
 
     required_cols = ["symbol", "stock_name", "today_turnover"]
+    if "stock_name" in stock_list.columns:                       # 補上股票名稱（2026-10-27）
+        stock_list = stock_list.copy()
+        _empty = stock_list["stock_name"].fillna("").astype(str).str.strip().isin(["", "nan", "None"])
+        stock_list.loc[_empty, "stock_name"] = stock_list.loc[_empty, "symbol"].map(get_stock_name)
     for col in required_cols:
         if col not in stock_list.columns:
             stock_list[col] = "" if col == "stock_name" else np.nan
@@ -4259,6 +4272,56 @@ def metrics_row(prefix: str, metrics: dict) -> dict:
     }
 
 
+LAST_POOL_DECISIONS: dict = {"rows": None, "target": None}
+
+
+def build_full_pool_decisions(shared_result: dict, shared_config: PipelineConfig) -> pd.DataFrame:
+    """以個股深度分析（Mode 1）相同的完整規則（含回測支撐進場計畫）計算股票池各股最新決策。"""
+    prediction_results = shared_result["prediction_results"].copy()
+    prediction_results["symbol"] = prediction_results["symbol"].astype(str)
+    base_all = build_single_diagnostic_output_frame(
+        prediction_results, shared_config, shared_result["safety_target_col"], shared_result["return_target_col"])
+    thresholds = {
+        "volatility_10d_q80": pd.to_numeric(base_all["volatility_10d"], errors="coerce").quantile(0.80),
+        "support_distance_q80": pd.to_numeric(base_all["support_distance"], errors="coerce").quantile(0.80),
+        "resistance_distance_q20": pd.to_numeric(base_all["resistance_distance"], errors="coerce").quantile(0.20),
+    }
+    out = apply_single_diagnostic_decision_outputs(base_all, thresholds)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    return out.sort_values("date").groupby(out["symbol"].astype(str)).tail(1).reset_index(drop=True)
+
+
+def print_full_decision_table(decisions: pd.DataFrame, title: str) -> pd.DataFrame:
+    """印出股票池完整決策總表（依最終分數排序），回傳排序後的表。"""
+    from pipeline_ai import _translated_row, hard_conditions
+    rows = []
+    for _, r in decisions.iterrows():
+        tr = _translated_row(r.to_dict())
+        conds = hard_conditions(tr)
+        rows.append({
+            "代號": str(tr.get("symbol")),
+            "名稱": get_stock_name(tr.get("symbol")),
+            "市場": lookup_symbol_market(str(tr.get("symbol")), "TWSE"),
+            "收盤": tr.get("close"),
+            "系統決策": tr.get("final_decision_label_zh") or tr.get("final_decision_label"),
+            "最終分數": pd.to_numeric(tr.get("final_decision_score"), errors="coerce"),
+            "硬條件": f"{sum(1 for c in conds if c['pass'])}/5",
+            "建議倉位": pd.to_numeric(tr.get("suggested_position_pct"), errors="coerce"),
+            "回測支撐計畫": "是" if bool(tr.get("entry_plan_override", False)) else "",
+        })
+    table = pd.DataFrame(rows).sort_values("最終分數", ascending=False).reset_index(drop=True)
+    show = table.copy()
+    show["最終分數"] = show["最終分數"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "NA")
+    show["建議倉位"] = show["建議倉位"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "NA")
+    show["收盤"] = show["收盤"].map(lambda x: f"{float(x):.2f}" if pd.notna(x) else "NA")
+    print()
+    print("-" * 70)
+    print(title)
+    print("-" * 70)
+    print(show.to_string(index=False))
+    return table
+
+
 def run_shared_single_stock_diagnostic(
     config: PipelineConfig,
     top_n: int = 30,
@@ -4307,6 +4370,14 @@ def run_shared_single_stock_diagnostic(
         "resistance_distance_q20": pd.to_numeric(diagnostic_base_all["resistance_distance"], errors="coerce").quantile(0.20),
     }
     diagnostic_output_all = apply_single_diagnostic_decision_outputs(diagnostic_base_all, risk_thresholds)
+    # 決策代理用：保留整個股票池各股最新一筆決策（不影響本模式任何輸出；2026-10-26）
+    try:
+        _all = diagnostic_output_all.copy()
+        _all["date"] = pd.to_datetime(_all["date"], errors="coerce")
+        LAST_POOL_DECISIONS["rows"] = _all.sort_values("date").groupby(_all["symbol"].astype(str)).tail(1).reset_index(drop=True)
+        LAST_POOL_DECISIONS["target"] = target_symbol
+    except Exception:
+        LAST_POOL_DECISIONS["rows"] = None
     output_df = diagnostic_output_all[diagnostic_output_all["symbol"].astype(str) == target_symbol].copy()
     if output_df.empty:
         raise ValueError(f"single diagnostic output missing target symbol after decision enrichment: {target_symbol}")
@@ -4709,7 +4780,7 @@ def print_multi_stock_presentation_report(ranking_df: pd.DataFrame) -> None:
     for _, row in ranking_df.iterrows():
         print(
             f"{int(row.get('rank', 0)):<5} "
-            f"{str(row.get('symbol', 'NA')):<7} "
+            f"{stock_label(row.get('symbol', 'NA')):<10} "
             f"{format_report_date(row.get('date')):<10} "
             f"{format_report_price(row.get('close')):<9} "
             f"{format_decision_score(row.get('safety_score')):<7} "
@@ -4727,7 +4798,7 @@ def print_multi_stock_presentation_report(ranking_df: pd.DataFrame) -> None:
     for _, row in ranking_df.iterrows():
         print()
         print("-" * 70)
-        print(f"Rank {int(row.get('rank', 0))}｜{row.get('symbol', 'NA')}")
+        print(f"Rank {int(row.get('rank', 0))}｜{stock_label(row.get('symbol', 'NA'))}")
         print("-" * 70)
         print(f"資料日期：{format_report_date(row.get('date'))}")
         print(f"最新收盤價：{format_report_price(row.get('close'))}")
@@ -4878,6 +4949,14 @@ def run_common_model_train(
         feature_set=shared_config.feature_set,
     )
 
+    # 完整決策（與個股深度分析相同規則；2026-10-27）
+    full_decisions = None
+    try:
+        full_decisions = build_full_pool_decisions(shared_result, shared_config)
+        LAST_POOL_DECISIONS["rows"], LAST_POOL_DECISIONS["target"] = full_decisions, None
+    except Exception as exc:
+        print(f"WARNING: 完整決策計算失敗（不影響排名輸出）：{exc}")
+
     if presentation:
         with contextlib.redirect_stdout(io.StringIO()):
             save_walk_forward_validation_report(metrics, shared_config)
@@ -4909,6 +4988,20 @@ def run_common_model_train(
         print(f"ranking CSV: {ranking_csv}")
         print(f"ranking Excel: {ranking_xlsx}")
         print(f"training data CSV: {combined_csv}")
+
+    if full_decisions is not None and not full_decisions.empty:
+        table = print_full_decision_table(
+            full_decisions,
+            "十一、股票池完整決策總表（與個股深度分析相同規則，含回測支撐進場計畫；以此為最終決策）")
+        try:
+            ts = datetime.today().strftime("%Y%m%d_%H%M%S")
+            path = OUTPUT_DIR / f"mode2_full_decisions_{ts}.csv"
+            table.to_csv(path, index=False, encoding="utf-8-sig")
+            print(f"完整決策總表已輸出：{path}")
+        except Exception as exc:
+            print(f"WARNING: 完整決策總表存檔失敗：{exc}")
+        from pipeline_ai import run_ai_for_rows
+        run_ai_for_rows(full_decisions, shared_config, title_prefix="十二、AI 分析師解讀（排名前段股票）", max_n=3)
 
     return prediction_results
 

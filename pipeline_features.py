@@ -1079,7 +1079,10 @@ def add_structural_features(df: pd.DataFrame) -> pd.DataFrame:
         print("Missing structural source warning：")
         print(sorted(missing_sources))
 
-    return out.replace([np.inf, -np.inf], np.nan)
+    out = out.replace([np.inf, -np.inf], np.nan)
+    # 籌碼與營收特徵（--chip-features 開啟時才加入；2026-10-26）
+    from pipeline_chip import add_chip_features
+    return add_chip_features(out)
 
 
 __all__ = [name for name in globals() if not name.startswith('__')]

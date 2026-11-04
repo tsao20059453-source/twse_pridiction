@@ -270,6 +270,9 @@ def generate_backtest_history(
     return oos_df
 
 
+RETURN_20D_PURGE_DATES = 20
+
+
 def generate_oos_predictions_for_backtest(
     df: pd.DataFrame,
     config: PipelineConfig,
@@ -411,6 +414,15 @@ def generate_oos_predictions_for_backtest(
         # 額外訓練 20 日 return 輔助模型（return_20d_score），供 Portfolio 加碼/停利/trailing 邏輯使用
         if use_return_20d and feature_cols_20d:
             train_mask_20d = valid_mask_20d.iloc[train_idx]
+            # 20 日標籤要往後看 20 個交易日：清洗期擴大為 20（舊做法 purge=0 時不額外清洗）
+            if get_walk_forward_purge() > 0:
+                test_start_ts = pd.Timestamp(test_dates.min())
+                pos_20 = int(unique_dates_bt.searchsorted(test_start_ts)) - 1 - RETURN_20D_PURGE_DATES
+                if pos_20 >= 0:
+                    cutoff_20 = unique_dates_bt.iloc[pos_20]
+                    train_mask_20d = train_mask_20d & (train_dates <= cutoff_20).to_numpy()
+                else:
+                    train_mask_20d = train_mask_20d & False
             if int(train_mask_20d.sum()) >= 30:
                 X20_train = model_df.iloc[train_idx][feature_cols_20d][train_mask_20d.values]
                 y20_train = y_return20d.iloc[train_idx][train_mask_20d.values]
@@ -438,7 +450,7 @@ def generate_oos_predictions_for_backtest(
             train_end_date = latest_td.date() if pd.notna(latest_td) else "N/A"
             train_start_date = train_dates.min().date() if not train_dates.empty else "N/A"
             print(f"[回測資料生成] Fold 1 train：{train_start_date} ~ {train_end_date}  "
-                  f"→ test_fold_1 起始：{test_start}")
+                  f"→ test_fold_1 起始：{test_start}（清洗期 {get_walk_forward_purge()} 個交易日）")
         print(
             f"[回測資料生成] Fold {fold_no}/{n_splits}："
             f"{test_start} ~ {test_end}，{len(test_idx)} 筆"
@@ -969,7 +981,7 @@ def run_portfolio_backtest(
     # ── 股票池組成驗證 ───────────────────────────────────────────────
     pool_symbols = sorted(str(s) for s in (all_stock_signals or {}).keys())
     if not investor_mode:
-        print(f"回測股票池：{pool_symbols}")
+        print(f"回測股票池：{[stock_label(s) for s in pool_symbols]}")
         print(f"股票數量：{len(pool_symbols)}")
     if expected_symbols is not None:
         expected_set = {str(s) for s in expected_symbols}

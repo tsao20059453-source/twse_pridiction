@@ -92,3 +92,12 @@ data/cache/
 broker/
 補齊大型檔案.bat
 資料夾說明.md
+
+# AI 呼叫紀錄（含完整 prompt／回應，不含金鑰）
+logs/
+
+# 決策代理的提問紀錄（2026-10-26）
+data/agent_memory/
+
+# 固定股票池（重現回測需要，必須上傳；2026-10-27）
+!pools/*.csv
