@@ -8,6 +8,7 @@ from pipeline_historical_universe import (
     load_daily_snapshot_prices,
     schedule_oos_signals_for_next_open,
 )
+from pipeline_weight_optimization import run_score_weight_optimization
 
 def aggregate_trades_by_entry(trade_log: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1400,6 +1401,16 @@ def run_backtest_mode(
     investor_mode: bool = False,
     daily_top30_universe: bool = False,
     daily_top30_rank_metric: str = "volume",
+    optimize_score_weights: bool = False,
+    optimization_tuning_folds: int = 8,
+    optimization_maxiter: int = 12,
+    optimization_popsize: int = 5,
+    optimization_regularization: float = 0.05,
+    optimization_min_trades: int = 30,
+    optimization_ai_range_audit: bool = False,
+    optimization_max_weight: float = 0.60,
+    optimization_entry_threshold_min: float = 0.50,
+    optimization_entry_threshold_max: float = 0.80,
 ) -> None:
     """
     Top-level coordinator for Mode 3 backtest analysis.
@@ -1511,6 +1522,25 @@ def run_backtest_mode(
 
     if oos_df.empty:
         print("OOS 預測資料不足，無法執行回測。")
+        return
+
+    if optimize_score_weights:
+        if not daily_top30_universe:
+            raise ValueError("權重最佳化目前只支援 --daily-top30-universe 的 point-in-time 回測。")
+        run_score_weight_optimization(
+            oos_df=oos_df,
+            config=config,
+            market_df=market_df,
+            tuning_folds=optimization_tuning_folds,
+            maxiter=optimization_maxiter,
+            popsize=optimization_popsize,
+            regularization=optimization_regularization,
+            min_total_trades=optimization_min_trades,
+            ai_range_audit=optimization_ai_range_audit,
+            max_weight=optimization_max_weight,
+            entry_threshold_min=optimization_entry_threshold_min,
+            entry_threshold_max=optimization_entry_threshold_max,
+        )
         return
 
     # ── 候選股排名：最後一個交易日，依 final_decision_score 降序 Top 10 ──

@@ -993,6 +993,9 @@ def run_portfolio_backtest(
 
     initial_capital = config.backtest_initial_capital
     max_positions   = config.backtest_max_positions
+    entry_threshold = float(getattr(config, "backtest_entry_threshold", 0.55))
+    if not 0.0 <= entry_threshold <= 1.0:
+        raise ValueError("backtest_entry_threshold must be between 0 and 1")
     max_hold_days   = 60   # 60日期限到期（原 30 日強制出場已移除）
 
     # ── 倉位管理參數（金字塔式分層加碼：試倉 + 加碼1 + 加碼2）──────────
@@ -1330,7 +1333,7 @@ def run_portfolio_backtest(
             override = bool(override_raw) if pd.notna(override_raw) else False
         except (TypeError, ValueError):
             override = False
-        return bool(override or score >= 0.55), score, override
+        return bool(override or score >= entry_threshold), score, override
 
     def _entry_support_reason(
         row,
@@ -2402,7 +2405,7 @@ def run_portfolio_backtest(
                 close     = _entry_decision_close(row)
                 execution_price = _entry_execution_price(row)
 
-                if not (override or score >= 0.55):
+                if not (override or score >= entry_threshold):
                     continue
                 # 獲利出場冷卻期：期間內不接受同標的新進場
                 if sym in profit_exit_cooldowns and current_date <= profit_exit_cooldowns[sym]:

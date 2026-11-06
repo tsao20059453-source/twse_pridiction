@@ -338,6 +338,32 @@ def main() -> None:
              "rule_rr_v2＝規則與風險報酬各 0.5（2026-10-26 新增）",
     )
     parser.add_argument(
+        "--optimize-score-weights",
+        action="store_true",
+        help="以 DE 對四個 final score 權重與進場門檻做巢狀 walk-forward 最佳化；僅支援 daily Top-N 回測。",
+    )
+    parser.add_argument("--optimization-tuning-folds", type=int, default=8,
+                        help="最佳化使用的前段 OOS folds 數量，剩餘 folds 保留作最終測試。")
+    parser.add_argument("--optimization-maxiter", type=int, default=12,
+                        help="Differential Evolution 世代數。")
+    parser.add_argument("--optimization-popsize", type=int, default=5,
+                        help="Differential Evolution 每個維度的母體倍率。")
+    parser.add_argument("--optimization-regularization", type=float, default=0.05,
+                        help="偏離目前 score profile 權重的 L2 正則化係數。")
+    parser.add_argument("--optimization-min-trades", type=int, default=30,
+                        help="調參期間最低總進場筆數限制。")
+    parser.add_argument(
+        "--optimization-ai-range-audit",
+        action="store_true",
+        help="讓 Claude 只根據調參 folds 產出下一次實驗的搜尋範圍建議；不會自動套用或改變本次結果。",
+    )
+    parser.add_argument("--optimization-max-weight", type=float, default=0.60,
+                        help="單一 final score 權重的最大值。")
+    parser.add_argument("--optimization-entry-threshold-min", type=float, default=0.50,
+                        help="DE 搜尋的進場門檻下界。")
+    parser.add_argument("--optimization-entry-threshold-max", type=float, default=0.80,
+                        help="DE 搜尋的進場門檻上界。")
+    parser.add_argument(
         "--include-otc",
         action="store_true",
         help="股票池納入上櫃股票：上市＋上櫃合併依當日成交金額取前 N 檔（個股分析會自動判別上市／上櫃，不需此參數）",
@@ -630,6 +656,16 @@ def main() -> None:
             investor_mode=args.investor_mode or False,
             daily_top30_universe=args.daily_top30_universe,
             daily_top30_rank_metric=args.daily_top30_rank_metric,
+            optimize_score_weights=args.optimize_score_weights,
+            optimization_tuning_folds=args.optimization_tuning_folds,
+            optimization_maxiter=args.optimization_maxiter,
+            optimization_popsize=args.optimization_popsize,
+            optimization_regularization=args.optimization_regularization,
+            optimization_min_trades=args.optimization_min_trades,
+            optimization_ai_range_audit=args.optimization_ai_range_audit,
+            optimization_max_weight=args.optimization_max_weight,
+            optimization_entry_threshold_min=args.optimization_entry_threshold_min,
+            optimization_entry_threshold_max=args.optimization_entry_threshold_max,
         )
         return
 

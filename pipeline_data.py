@@ -139,6 +139,9 @@ class PipelineConfig:
     display_mode: str = "presentation"
     backtest_initial_capital: float = 1_000_000.0
     backtest_max_positions: int = 8
+    # Kept configurable so walk-forward score optimization can evaluate an
+    # entry threshold without changing the execution, cost, or exit rules.
+    backtest_entry_threshold: float = 0.55
     backtest_atr_trailing_multiplier: float = 2.0
     backtest_ma_exit_period: int = 20
     backtest_partial_exit_ratio: float = 0.5
