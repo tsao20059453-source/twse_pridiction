@@ -7,7 +7,7 @@
 
 ## 參數
 
-- `--pool-csv`：固定股票池，不再抓執行當天的排行。
+- `--pool-csv`：固定股票池，不再抓執行當天的排行；由於每日 Top N 已是預設，固定池重現時必須一併加上 `--no-daily-top30-universe`。
 - `--as-of`：把這天視為「今天」，只用到這天為止的本地快取，不上網、不寫回快取；近 3 年區間也以這天往回算。
 - `--purge-days`：walk-forward 清洗期（交易日）。**預設 10**（2026-10-26 起，修正訓練／測試標籤重疊）；設 `0` 為論文版的舊做法。
 - 價格還原：**預設開啟**（2026-10-26 起）。先用 `data/chip/dividends.csv`（FinMind 除權息參考價）還原現金股利與配股，
@@ -37,7 +37,7 @@
 
 誠實基準指令：
 ```
-python Pipeline_clean.py --mode backtest --symbol ALL --top-n 30 --no-investor-mode --pool-csv pools/pool_top30_20261025.csv --as-of 2026-10-25
+python Pipeline_clean.py --mode backtest --symbol ALL --top-n 30 --no-investor-mode --no-daily-top30-universe --pool-csv pools/pool_top30_20261025.csv --as-of 2026-10-25
 ```
 
 ## 論文版（總報酬 120.62%）

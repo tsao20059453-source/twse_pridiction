@@ -19,6 +19,7 @@ models/
 *.pkl
 *.csv
 *.xlsx
+!data/chip/dividends.csv
 
 # IDE
 .vscode/

@@ -1262,22 +1262,45 @@ def set_price_adjust(enabled: bool = True) -> None:
 
 def _adjust_one_symbol(g: pd.DataFrame, verbose: bool) -> pd.DataFrame:
     g = g.sort_values("date").reset_index(drop=True).copy()
+    dates = pd.to_datetime(g["date"], errors="coerce")
     close = pd.to_numeric(g["close"], errors="coerce")
     open_ = pd.to_numeric(g["open"], errors="coerce")
     prev = close.shift(1)
     sym = str(g["symbol"].iloc[0]) if "symbol" in g.columns else ""
-    f_div = pd.to_datetime(g["date"]).map(_dividend_factors(sym)).astype(float).fillna(1.0)
+    dividend_factors = _dividend_factors(sym).copy()
+    dividend_factors.index = pd.to_datetime(dividend_factors.index, errors="coerce")
+    dividend_factors = dividend_factors[
+        dividend_factors.index.notna()
+        & dividend_factors.index.to_series().between(dates.min(), dates.max())
+    ]
+    f_div = dates.map(dividend_factors).astype(float).fillna(1.0)
     f_div.index = g.index
     jump = (close / (prev * f_div) - 1).abs() > PRICE_LIMIT_TOLERANCE      # 除權息後仍超過漲跌幅 → 面額變更／減資等
     event = jump & prev.notna() & (prev > 0) & open_.notna() & (open_ > 0)
-    f = np.where(event, (open_ / prev).clip(0.05, 20.0), f_div)
-    f = pd.Series(f, index=g.index).fillna(1.0)
-    after = f.iloc[::-1].cumprod().iloc[::-1] / f            # Π_{t>s} f_t
+    event_total_factor = (open_ / prev).clip(0.05, 20.0)
+    # event_total_factor already includes any same-day cash dividend. Divide
+    # by f_div so a known dividend and an inferred split are not counted twice.
+    inferred_event_factors = pd.Series(
+        event_total_factor[event].to_numpy() / f_div[event].to_numpy(),
+        index=dates[event],
+        dtype=float,
+    )
+    all_factors = pd.concat([dividend_factors, inferred_event_factors])
+    all_factors = all_factors.groupby(level=0).prod().sort_index()
+    if all_factors.empty:
+        after = pd.Series(1.0, index=g.index, dtype=float)
+    else:
+        # Daily Top-N snapshots can omit a security on its ex-dividend date. Use
+        # the event calendar rather than only rows currently present in g, so the
+        # adjustment still reaches all earlier retained observations.
+        after = pd.Series(
+            [float(all_factors.loc[all_factors.index > date].prod()) for date in dates],
+            index=g.index,
+            dtype=float,
+        ).fillna(1.0)                                  # Π_{event date > t} f_t
     g["adj_factor"] = after.astype(float)
     g["corporate_action_flag"] = event.astype(bool)
     g["is_ex_dividend_date"] = (f_div < 1.0) & ~event
-    if not (event.any() or (f_div < 1.0).any()):
-        return g
     for col in ("open", "high", "low", "close"):
         if col in g.columns:
             g[col] = pd.to_numeric(g[col], errors="coerce") * g["adj_factor"]
@@ -1290,7 +1313,7 @@ def _adjust_one_symbol(g: pd.DataFrame, verbose: bool) -> pd.DataFrame:
             print(f"[價格還原] {sym} 套用除權息 {n_div} 次（FinMind 除權息參考價）")
         for i in np.flatnonzero(event.to_numpy()):
             print(f"[價格還原] {sym} {pd.Timestamp(g.loc[i, 'date']).date()} 單日 {prev.iloc[i]:.2f} → {close.iloc[i]:.2f}"
-                  f"（超過漲跌幅，視為除權／面額變更），之前價格 × {f.iloc[i]:.4f}")
+                  f"（超過漲跌幅，視為除權／面額變更），之前價格 × {event_total_factor.iloc[i]:.4f}")
     return g
 
 

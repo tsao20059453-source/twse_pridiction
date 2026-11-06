@@ -310,8 +310,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--daily-top30-universe",
-        action="store_true",
-        help="回測時依每個交易日的實際 Top N 股票池建模與選股，不使用固定 CSV 股票池。",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="回測時依每個交易日的實際 Top N 股票池建模與選股；預設啟用。使用 --no-daily-top30-universe 才會改用固定 CSV 股票池。",
     )
     parser.add_argument(
         "--daily-top30-rank-metric",

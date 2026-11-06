@@ -3550,6 +3550,10 @@ def fetch_and_prepare_multi_stock_data_historical(
                 df = historical_price_data[
                     historical_price_data["symbol"].astype(str) == str(symbol)
                 ].copy()
+                # Daily Top-N snapshots are already point-in-time filtered,
+                # so they bypass get_historical_trading_data(). Apply the
+                # same corporate-action adjustment before feature creation.
+                df = adjust_for_corporate_actions(df, verbose=False)
 
             if df is None or df.empty:
                 print(f"股票 {symbol} 無資料，略過。")
