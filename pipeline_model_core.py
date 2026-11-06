@@ -132,11 +132,18 @@ def add_low_subjective_targets(df: pd.DataFrame, horizon: int = 10) -> pd.DataFr
 
     if "date" in out.columns:
         out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        eligible = None
+        if "historical_universe_eligible" in out.columns:
+            eligible = out["historical_universe_eligible"].fillna(False).astype(bool)
         out[f"target_return_{horizon}d_cs_rank"] = (
-            out.groupby("date")[f"target_return_{horizon}d"].rank(pct=True)
+            out[f"target_return_{horizon}d"].where(eligible).groupby(out["date"]).rank(pct=True)
+            if eligible is not None
+            else out.groupby("date")[f"target_return_{horizon}d"].rank(pct=True)
         )
         out[f"target_downside_risk_{horizon}d_cs_rank"] = (
-            out.groupby("date")[f"target_downside_risk_{horizon}d"].rank(pct=True)
+            out[f"target_downside_risk_{horizon}d"].where(eligible).groupby(out["date"]).rank(pct=True)
+            if eligible is not None
+            else out.groupby("date")[f"target_downside_risk_{horizon}d"].rank(pct=True)
         )
     else:
         print("WARNING: date column missing; low-subjective cross-sectional target ranks use global rank fallback.")
@@ -156,7 +163,9 @@ def add_low_subjective_targets(df: pd.DataFrame, horizon: int = 10) -> pd.DataFr
 
     if "date" in out.columns:
         out[f"target_rar_{horizon}d_cs_rank"] = (
-            out.groupby("date")[f"target_rar_{horizon}d"].rank(pct=True)
+            out[f"target_rar_{horizon}d"].where(eligible).groupby(out["date"]).rank(pct=True)
+            if "historical_universe_eligible" in out.columns
+            else out.groupby("date")[f"target_rar_{horizon}d"].rank(pct=True)
         )
     else:
         out[f"target_rar_{horizon}d_cs_rank"] = out[f"target_rar_{horizon}d"].rank(pct=True)

@@ -44,6 +44,13 @@ from pipeline_data import (
     get_historical_market_index_data,
     CONFIG as DEFAULT_CONFIG,
 )
+from pipeline_historical_universe import (
+    append_unscored_execution_rows,
+    build_daily_top_n_membership,
+    load_shared_market_index,
+    load_daily_snapshot_prices,
+    set_shared_snapshot_cache_dir,
+)
 
 
 # ============================================================
@@ -139,6 +146,9 @@ def run_historical_event_backtest(
     event: dict,
     base_config: PipelineConfig,
     symbols: list[str],
+    top_n: int = 30,
+    universe_mode: str = "frozen",
+    universe_rank_metric: str = "volume",
 ) -> dict:
     """
     對單一歷史事件視窗執行完整回測流程。
@@ -162,24 +172,58 @@ def run_historical_event_backtest(
     print(f"       測試區間：{test_start} ~ {test_end}  burn-in：{burn_in_months} 個月")
     print("=" * 70)
 
-    # ── Step 5-1：抓取歷史資料（含 burn-in）─────────────────────────
+    # ── Step 5-1：取得交易日曆與（可選的）每日時點股票池 ────────────
+    market_df = load_shared_market_index(
+        start_date=test_start,
+        end_date=test_end,
+        burn_in_months=burn_in_months,
+    )
+    if not market_df.empty:
+        print(f"[HIST] 使用共享 TAIEX 快取：{len(market_df)} 個交易日。")
+    else:
+        market_df = get_historical_market_index_data(
+            config=base_config,
+            start_date=test_start,
+            end_date=test_end,
+            burn_in_months=burn_in_months,
+        )
+    active_symbols = list(symbols)
+    membership = None
+    snapshot_prices = None
+    if universe_mode == "daily_top30":
+        if market_df.empty or "date" not in market_df.columns:
+            raise ValueError("每日 Top-N 股票池需要完整的 TWSE 交易日曆")
+        membership = build_daily_top_n_membership(
+            trading_dates=market_df["date"],
+            top_n=top_n,
+            rank_metric=universe_rank_metric,
+            sleep_sec=max(float(base_config.sleep_sec), 0.8),
+        )
+        active_symbols = sorted(membership["symbol"].astype(str).unique().tolist())
+        metric_label = "成交量" if universe_rank_metric == "volume" else "成交金額"
+        print(f"[HIST] 每日{metric_label} Top {top_n} 股票池完成：期間聯集 {len(active_symbols)} 檔。")
+    if universe_mode in {"snapshot_frozen", "daily_top30"}:
+        if not active_symbols:
+            raise ValueError("快照股票池沒有可處理的股票代碼")
+        snapshot_prices = load_daily_snapshot_prices(
+            trading_dates=market_df["date"],
+            symbols=active_symbols,
+            sleep_sec=0.8,
+        )
+
+    # ── Step 5-2：抓取歷史資料（含 burn-in）─────────────────────────
     combined_data = fetch_and_prepare_multi_stock_data_historical(
-        symbols=symbols,
+        symbols=active_symbols,
         base_config=base_config,
         start_date=test_start,
         end_date=test_end,
         burn_in_months=burn_in_months,
+        universe_membership=membership,
+        historical_price_data=snapshot_prices,
+        market_index_data=market_df,
     )
 
-    # ── 大盤指數（事件視窗用）────────────────────────────────────────
-    market_df = get_historical_market_index_data(
-        config=base_config,
-        start_date=test_start,
-        end_date=test_end,
-        burn_in_months=burn_in_months,
-    )
-
-    # ── Step 5-2：walk-forward OOS 預測（對合併後資料整體呼叫一次）────
+    # ── Step 5-3：walk-forward OOS 預測（對合併後資料整體呼叫一次）────
     # generate_oos_predictions_for_backtest 設計為接受多股票合併 DataFrame，
     # 在 walk-forward 每個 fold 內做跨股票橫斷面排名，不能逐股票分開呼叫。
     # min_train_date_cutoff=test_start：讓函式自行在 model_df（valid_mask 後）
@@ -200,6 +244,12 @@ def run_historical_event_backtest(
         (oos_full["date"] >= pd.Timestamp(test_start))
         & (oos_full["date"] <= pd.Timestamp(test_end))
     ].copy()
+    if membership is not None:
+        raw_in_window = combined_data[
+            (pd.to_datetime(combined_data["date"], errors="coerce") >= pd.Timestamp(test_start))
+            & (pd.to_datetime(combined_data["date"], errors="coerce") <= pd.Timestamp(test_end))
+        ].copy()
+        oos_in_window = append_unscored_execution_rows(oos_in_window, raw_in_window)
 
     # 拆分為逐股 dict 供 run_portfolio_backtest 使用
     all_stock_signals: dict[str, pd.DataFrame] = {}
@@ -222,12 +272,12 @@ def run_historical_event_backtest(
             "test_end": test_end,
         }
 
-    # ── Step 5-3：Portfolio 回測（淨值曲線、MDD 只在此事件視窗內計算）──
+    # ── Step 5-4：Portfolio 回測（淨值曲線、MDD 只在此事件視窗內計算）──
     equity_curve, trade_log, _ = run_portfolio_backtest(
         all_stock_signals=all_stock_signals,
         config=base_config,
         market_df=market_df,
-        expected_symbols=symbols,
+        expected_symbols=active_symbols,
         investor_mode=True,
     )
 
@@ -381,25 +431,41 @@ def print_historical_summary_report(
     event_results: list[dict],
     pooled_stats: dict,
     events: list[dict],
+    universe_mode: str = "frozen",
+    universe_rank_metric: str = "volume",
 ) -> None:
     print("\n" + "=" * 90)
     print("歷史區間回測總表  balanced_v2_combined 策略")
     print("=" * 90)
     print()
-    print("[!]  選股池前視偏差（Look-Ahead Bias）揭露")
+    print("[!]  回測限制揭露")
     print("-" * 90)
-    print("  本回測使用「今日（程式執行當日）成交金額排行前 N 檔」作為股票池，")
-    print("  而非 2018-2022 年間各時間點的真實高成交量股票。")
-    print("  這代表我們是以『現在才知道的高流動性贏家』回測『過去』，")
-    print("  存在選股池層面的 look-ahead bias，歷史回測績效可能因此被高估。")
-    print("  此問題將於後續版本改以歷史期間成交量排行選股後修正。")
+    if universe_mode == "daily_top30":
+        metric_label = "成交量" if universe_rank_metric == "volume" else "成交金額"
+        print(f"  股票池依每個歷史交易日的實際{metric_label} Top N 建立，")
+        print("  不使用程式執行日的固定股票池，因此不含該層級的選股池前視偏差。")
+        print("  但交易引擎仍沿用原專案的同日收盤訊號、同日收盤成交假設；")
+        print("  此成交時點偏差未在本次股票池實驗中修正。")
+    else:
+        print("  本回測使用「今日（程式執行當日）成交金額排行前 N 檔」作為股票池，")
+        print("  而非 2018-2022 年間各時間點的真實高成交量股票。")
+        print("  這代表我們是以『現在才知道的高流動性贏家』回測『過去』，")
+        print("  存在選股池層面的 look-ahead bias，歷史回測績效可能因此被高估。")
     print()
 
-    # ── 現有主線基準 ────────────────────────────────────────────────
-    print("-" * 90)
-    print(f"【現有主線基準（近 3 年樣本內）】")
-    print(f"  CAGR：{_fmt_pct(_BASELINE_CAGR)}")
-    print()
+    # The historical constant uses a different period and setup, so it is not
+    # a valid comparator for snapshot-based universe experiments.
+    if universe_mode == "frozen":
+        print("-" * 90)
+        print("【現有主線基準（近 3 年樣本內）】")
+        print(f"  CAGR：{_fmt_pct(_BASELINE_CAGR)}")
+        print()
+    else:
+        print("-" * 90)
+        print("【比較基準】")
+        print("  請以相同事件、相同日快照與同一模型設定的對照組比較；")
+        print("  不顯示近 3 年主線硬編碼 CAGR，避免跨期間解讀。")
+        print()
 
     # ── 各事件結果 ──────────────────────────────────────────────────
     print("=" * 90)
@@ -588,6 +654,8 @@ def run_historical_backtest(
     top_n: int = 30,
     base_config: Optional[PipelineConfig] = None,
     force_refresh_pool: bool = False,
+    universe_mode: str = "frozen",
+    universe_rank_metric: str = "volume",
 ) -> None:
     """
     主流程入口。
@@ -612,8 +680,22 @@ def run_historical_backtest(
         backtest_max_positions=8,
     )
 
+    if universe_mode not in {"frozen", "snapshot_frozen", "daily_top30"}:
+        raise ValueError("universe_mode must be 'frozen', 'snapshot_frozen', or 'daily_top30'")
+    if universe_rank_metric not in {"volume", "turnover"}:
+        raise ValueError("universe_rank_metric must be 'volume' or 'turnover'")
+
     # ── 建立／載入股票池（快取優先，確保可重現性）───────────────────
-    stock_list, symbols = _load_or_build_stock_pool(run_config, top_n, force_refresh_pool)
+    if universe_mode in {"frozen", "snapshot_frozen"}:
+        stock_list, symbols = _load_or_build_stock_pool(run_config, top_n, force_refresh_pool)
+    else:
+        stock_list = pd.DataFrame()
+        symbols = []
+        metric_label = "成交量" if universe_rank_metric == "volume" else "成交金額"
+        print(
+            f"[HIST] 每日 Top {top_n} 模式：每個交易日依當日{metric_label}重建股票池，"
+            "不使用今天凍結的股票名單。"
+        )
 
     model_config = build_shared_common_model_config(run_config)
 
@@ -637,6 +719,9 @@ def run_historical_backtest(
                 event=event,
                 base_config=model_config,
                 symbols=symbols,
+                top_n=top_n,
+                universe_mode=universe_mode,
+                universe_rank_metric=universe_rank_metric,
             )
             event_results.append(result)
             print_single_event_detail(result, event)
@@ -673,7 +758,34 @@ def run_historical_backtest(
             event_results=event_results,
             pooled_stats=pooled_stats or {},
             events=target_events,
+            universe_mode=universe_mode,
+            universe_rank_metric=universe_rank_metric,
         )
+
+    if not any(bool(result.get("metrics")) for result in event_results):
+        raise RuntimeError("所有指定事件均失敗，未產生任何可比較的回測結果。")
+
+    if universe_mode == "daily_top30":
+        print("\n" + "=" * 70)
+        print("時點股票池憑證（Point-in-time Universe）")
+        print("=" * 70)
+        metric_label = "成交量" if universe_rank_metric == "volume" else "成交金額"
+        print(f"  模式：每日{metric_label} Top {top_n}")
+        print("  快取目錄：data/raw/twse_daily_universe")
+        print("  選股時點：每個交易日收盤後；交易引擎仍沿用原專案的同日收盤成交假設。")
+        print("=" * 70)
+        print("\n[HIST] 歷史回測完成。")
+        return
+
+    if universe_mode == "snapshot_frozen":
+        print("\n" + "=" * 70)
+        print("固定股票池快照控制組憑證（Snapshot Frozen Control）")
+        print("=" * 70)
+        print(f"  模式：固定 Top {top_n} 股票池，使用與每日模式相同的日市場快照")
+        print("  用途：與 daily_top30 隔離比較股票池成分效果。")
+        print("=" * 70)
+        print("\n[HIST] 歷史回測完成。")
+        return
 
     # ── 可重現性憑證：印出凍結股票池清單 ────────────────────────────
     cache_path = Path(__file__).parent / f"historical_stock_pool_top{top_n}.csv"
@@ -729,7 +841,25 @@ if __name__ == "__main__":
             "確保每次執行使用相同股票、結果可重現。"
         ),
     )
+    parser.add_argument(
+        "--universe-mode",
+        choices=["frozen", "snapshot_frozen", "daily_top30"],
+        default="frozen",
+        help="frozen 使用原本資料與固定池；snapshot_frozen 為同資料來源的固定池控制組；daily_top30 使用各歷史交易日的 Top N。",
+    )
+    parser.add_argument(
+        "--universe-rank-metric",
+        choices=["volume", "turnover"],
+        default="volume",
+        help="daily_top30 的排序依據：volume（預設，與主專題一致）或 turnover。",
+    )
+    parser.add_argument(
+        "--snapshot-cache-dir",
+        default=None,
+        help="可選：相容的每日全市場快取目錄，唯讀使用以避免重抓 TWSE 日報。",
+    )
     args = parser.parse_args()
+    set_shared_snapshot_cache_dir(args.snapshot_cache_dir)
 
     if args.events is not None and "all" in args.events:
         event_names = None  # run_historical_backtest 內部 None = 只跑第一個，所以改為全部
@@ -743,4 +873,6 @@ if __name__ == "__main__":
         event_names=event_names,
         top_n=args.top_n,
         force_refresh_pool=args.force_refresh_pool,
+        universe_mode=args.universe_mode,
+        universe_rank_metric=args.universe_rank_metric,
     )

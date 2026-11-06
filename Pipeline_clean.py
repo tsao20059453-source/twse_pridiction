@@ -304,6 +304,27 @@ def main() -> None:
         help="可重現模式：資料基準日 YYYY-MM-DD，只用到這天的本地快取，不上網、不寫回快取",
     )
     parser.add_argument(
+        "--shared-raw-cache-dir",
+        default=None,
+        help="可選：可重現模式的唯讀個股與 TAIEX 原始快取目錄，不會寫入該目錄。",
+    )
+    parser.add_argument(
+        "--daily-top30-universe",
+        action="store_true",
+        help="回測時依每個交易日的實際 Top N 股票池建模與選股，不使用固定 CSV 股票池。",
+    )
+    parser.add_argument(
+        "--daily-top30-rank-metric",
+        choices=["volume", "turnover"],
+        default="volume",
+        help="每日 Top N 排序依據，預設 volume（成交量）。",
+    )
+    parser.add_argument(
+        "--shared-snapshot-cache-dir",
+        default=None,
+        help="每日 Top N 所需的唯讀全市場日快取目錄。",
+    )
+    parser.add_argument(
         "--purge-days",
         type=int,
         default=None,
@@ -341,6 +362,10 @@ def main() -> None:
                         help="AI 分析師報告不呼叫 API，只用確定性範本，並把 prompt 存進輸出 JSON")
     args, _ = parser.parse_known_args()
     set_reproducible_mode(pool_csv=args.pool_csv, as_of=args.as_of)
+    set_shared_raw_cache_dir(args.shared_raw_cache_dir)
+    if args.shared_snapshot_cache_dir:
+        from pipeline_historical_universe import set_shared_snapshot_cache_dir
+        set_shared_snapshot_cache_dir(args.shared_snapshot_cache_dir)
     set_price_adjust(not args.no_price_adjust)
     NAME_SETTINGS["allow_fetch"] = True          # 名稱查不到時可從 FinMind 補齊（可重現模式下不會上網）
     if args.include_otc:
@@ -603,6 +628,8 @@ def main() -> None:
             mode=bt_mode,
             run_profile_experiments=args.run_profile_experiments,
             investor_mode=args.investor_mode or False,
+            daily_top30_universe=args.daily_top30_universe,
+            daily_top30_rank_metric=args.daily_top30_rank_metric,
         )
         return
 

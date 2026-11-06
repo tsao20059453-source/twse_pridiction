@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from pipeline_model_output import *
 from pipeline_backtest_engine import *
+from pipeline_historical_universe import (
+    append_unscored_execution_rows,
+    build_daily_top_n_membership,
+    load_daily_snapshot_prices,
+)
 
 def aggregate_trades_by_entry(trade_log: pd.DataFrame) -> pd.DataFrame:
     """
@@ -533,6 +538,7 @@ def print_portfolio_report(
     print(f"平均每筆最終倉位：{avg_final_position:.1%}" if pd.notna(avg_final_position) else "平均每筆最終倉位：N/A")
     print(f"平均持倉曝險：{avg_exposure:.1%}" if pd.notna(avg_exposure) else "平均持倉曝險：N/A")
 
+
     # ── 大盤過濾統計 ───────────────────────────────────────────────
     total_days       = metrics.get("total_days", 0)
     filter_days      = metrics.get("filter_days", 0)
@@ -911,6 +917,91 @@ def print_portfolio_report(
         if trailing_summary_path is not None:
             print(f"Trailing stop forward-return summary saved: {trailing_summary_path}")
     print("=" * 70)
+
+
+def _run_daily_top_n_portfolio_backtest(
+    oos_df: pd.DataFrame,
+    config: PipelineConfig,
+    top_n: int,
+    rank_metric: str,
+    investor_mode: bool,
+) -> None:
+    """Run the portfolio directly from the point-in-time daily universe.
+
+    The normal batch path creates a static eligibility whitelist after
+    per-symbol diagnostics. That is not valid for a daily Top-N universe:
+    securities may enter or leave it, while unscored rows remain only for exits.
+    """
+    if oos_df.empty:
+        print("每日 Top-N OOS 資料不足，無法執行 Portfolio 回測。")
+        return
+
+    prediction_mask = oos_df.get(
+        "is_oos_prediction", pd.Series(True, index=oos_df.index)
+    ).fillna(False).astype(bool)
+    prediction_rows = oos_df.loc[prediction_mask].copy()
+    if prediction_rows.empty:
+        print("每日 Top-N 沒有有效的 OOS 模型預測列，無法執行 Portfolio 回測。")
+        return
+
+    cutoff_date = _symbol_eligibility_cutoff_date(prediction_rows, config)
+    portfolio_rows = oos_df.copy()
+    portfolio_rows["date"] = pd.to_datetime(portfolio_rows["date"], errors="coerce")
+    if cutoff_date is not None:
+        portfolio_rows = portfolio_rows[
+            portfolio_rows["date"] > pd.Timestamp(cutoff_date)
+        ].copy()
+        print(
+            "每日 Top-N 正式 Portfolio 回測排除前兩折 warm-up 期，"
+            f"績效自 {pd.Timestamp(cutoff_date).date()} 之後開始計算。"
+        )
+
+    symbols = sorted(portfolio_rows["symbol"].dropna().astype(str).unique().tolist())
+    all_stock_signals = {
+        symbol: portfolio_rows[portfolio_rows["symbol"].astype(str) == symbol].copy()
+        for symbol in symbols
+    }
+    print(
+        f"Step 3/3: 以每日 {rank_metric} Top {top_n} 的 OOS 訊號執行 Portfolio 回測"
+        f"（期間聯集 {len(symbols)} 檔；不使用事後靜態股票白名單）。"
+    )
+
+    print("取得 TAIEX 指數歷史資料（大盤過濾用）...")
+    try:
+        market_df = get_market_index_data(config)
+    except Exception as exc:
+        print(f"WARNING: TAIEX 指數資料取得失敗：{exc}")
+        market_df = pd.DataFrame()
+
+    try:
+        equity_curve, trade_log, metrics = run_portfolio_backtest(
+            all_stock_signals=all_stock_signals,
+            config=config,
+            market_df=market_df,
+            expected_symbols=symbols,
+            investor_mode=investor_mode,
+        )
+    except Exception as exc:
+        print(f"每日 Top-N Portfolio 回測失敗：{exc}")
+        return
+
+    print()
+    print_portfolio_report(metrics, equity_curve, config, investor_mode=investor_mode)
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(exist_ok=True)
+    timestamp = datetime.today().strftime("%Y%m%d_%H%M%S")
+    prefix = output_dir / (
+        f"{config.market.upper()}_daily_{rank_metric}_top{top_n}_portfolio_{timestamp}"
+    )
+    if not trade_log.empty:
+        trade_path = Path(f"{prefix}_trade_log.csv")
+        trade_log.to_csv(trade_path, index=False, encoding="utf-8-sig")
+        print(f"每日 Top-N 交易明細已輸出：{trade_path}")
+    if not equity_curve.empty:
+        equity_path = Path(f"{prefix}_equity_curve.csv")
+        equity_curve.to_csv(equity_path, index=False, encoding="utf-8-sig")
+        print(f"每日 Top-N 資產曲線已輸出：{equity_path}")
 
 
 def _buy_hold_metrics_from_equity(equity: pd.Series, dates: pd.Series) -> dict:
@@ -1306,6 +1397,8 @@ def run_backtest_mode(
     mode: str = "single",
     run_profile_experiments: bool = False,
     investor_mode: bool = False,
+    daily_top30_universe: bool = False,
+    daily_top30_rank_metric: str = "volume",
 ) -> None:
     """
     Top-level coordinator for Mode 3 backtest analysis.
@@ -1320,15 +1413,43 @@ def run_backtest_mode(
     else:
         print_presentation_process_header()
 
-    stock_list, symbols = build_shared_common_stock_pool(
-        base_config=config,
-        top_n=top_n,
-        target_symbol=target_symbol,
-        quiet=True,
-    )
     shared_config = build_shared_common_model_config(config)
     if target_symbol:
         shared_config = replace(shared_config, stock_no=target_symbol)
+
+    universe_membership = None
+    execution_source = None
+    if daily_top30_universe:
+        if target_symbol:
+            raise ValueError("每日 Top-N 股票池只支援批次 Portfolio 回測，不支援單股模式。")
+        if daily_top30_rank_metric not in {"volume", "turnover"}:
+            raise ValueError("daily_top30_rank_metric must be 'volume' or 'turnover'")
+        market_df = get_market_index_data(shared_config)
+        if market_df.empty or "date" not in market_df.columns:
+            raise ValueError("每日 Top-N 股票池需要完整 TAIEX 交易日曆。")
+        start_date = get_reference_today() - pd.DateOffset(years=int(shared_config.years))
+        end_date = get_reference_today()
+        trading_dates = pd.to_datetime(market_df["date"], errors="coerce")
+        trading_dates = trading_dates[trading_dates.between(start_date, end_date)]
+        universe_membership = build_daily_top_n_membership(
+            trading_dates=trading_dates,
+            top_n=top_n,
+            rank_metric=daily_top30_rank_metric,
+            sleep_sec=0,
+        )
+        symbols = sorted(universe_membership["symbol"].astype(str).unique().tolist())
+        stock_list = pd.DataFrame({"symbol": symbols})
+        print(
+            f"每日 {daily_top30_rank_metric} Top {top_n} 股票池："
+            f"{len(trading_dates)} 個交易日、期間聯集 {len(symbols)} 檔。"
+        )
+    else:
+        stock_list, symbols = build_shared_common_stock_pool(
+            base_config=config,
+            top_n=top_n,
+            target_symbol=target_symbol,
+            quiet=True,
+        )
 
     print(f"Step 1/3: 抓取 {len(symbols)} 支股票的歷史資料...")
     if not investor_mode:
@@ -1342,10 +1463,28 @@ def run_backtest_mode(
         print("require_sensitivity_data =", getattr(shared_config, "require_sensitivity_data", None))
         print("use_return_20d =", getattr(shared_config, "use_return_20d", None))
     with contextlib.redirect_stdout(io.StringIO()):
-        combined_data = fetch_and_prepare_multi_stock_data_with_config(
-            symbols=symbols,
-            base_config=shared_config,
-        )
+        if daily_top30_universe:
+            snapshot_prices = load_daily_snapshot_prices(
+                trading_dates=trading_dates,
+                symbols=symbols,
+                sleep_sec=0,
+            )
+            combined_data = fetch_and_prepare_multi_stock_data_historical(
+                symbols=symbols,
+                base_config=shared_config,
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+                burn_in_months=0,
+                universe_membership=universe_membership,
+                historical_price_data=snapshot_prices,
+                market_index_data=market_df,
+            )
+            execution_source = combined_data.copy()
+        else:
+            combined_data = fetch_and_prepare_multi_stock_data_with_config(
+                symbols=symbols,
+                base_config=shared_config,
+            )
 
     print(f"Step 2/3: 執行 12 折 rolling walk-forward OOS 預測生成（無資料洩漏）...")
     oos_df = generate_oos_predictions_for_backtest(
@@ -1353,6 +1492,14 @@ def run_backtest_mode(
         config=shared_config,
         n_splits=12,
     )
+
+    if daily_top30_universe and not oos_df.empty and execution_source is not None:
+        oos_dates = pd.to_datetime(oos_df["date"], errors="coerce")
+        execution_dates = pd.to_datetime(execution_source["date"], errors="coerce")
+        execution_source = execution_source.loc[
+            execution_dates.between(oos_dates.min(), oos_dates.max())
+        ].copy()
+        oos_df = append_unscored_execution_rows(oos_df, execution_source)
 
     if oos_df.empty:
         print("OOS 預測資料不足，無法執行回測。")
@@ -1471,6 +1618,16 @@ def run_backtest_mode(
             print(f"資產曲線已輸出：{ec_csv}")
 
     else:
+        if daily_top30_universe:
+            _run_daily_top_n_portfolio_backtest(
+                oos_df=oos_df,
+                config=config,
+                top_n=top_n,
+                rank_metric=daily_top30_rank_metric,
+                investor_mode=investor_mode,
+            )
+            return
+
         # 批次模式：逐股回測，彙整績效表
         bt_symbols = sorted(oos_df["symbol"].astype(str).unique().tolist())
         print(f"Step 3/3: 批次回測 {len(bt_symbols)} 支股票（每股獨立 OOS 回測）...")

@@ -341,6 +341,8 @@ def generate_oos_predictions_for_backtest(
         feature_cols_20d      = list(dict.fromkeys(numeric_features_20d + categorical_features))
 
     valid_mask = work[feature_cols + [safety_target_col]].notna().all(axis=1)
+    if "historical_universe_eligible" in work.columns:
+        valid_mask &= work["historical_universe_eligible"].fillna(False).astype(bool)
     model_df = work[valid_mask].reset_index(drop=True)
 
     X        = model_df[feature_cols]

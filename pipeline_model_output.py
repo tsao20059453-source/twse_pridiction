@@ -3505,6 +3505,9 @@ def fetch_and_prepare_multi_stock_data_historical(
     start_date: str,
     end_date: str,
     burn_in_months: int = 12,
+    universe_membership: Optional[pd.DataFrame] = None,
+    historical_price_data: Optional[pd.DataFrame] = None,
+    market_index_data: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     歷史區間版本的多股票資料準備函式。
@@ -3514,7 +3517,7 @@ def fetch_and_prepare_multi_stock_data_historical(
     特徵計算、target 建構邏輯與原函式完全相同。
     """
     all_frames = []
-    market_index_df = get_historical_market_index_data(
+    market_index_df = market_index_data.copy() if market_index_data is not None else get_historical_market_index_data(
         config=base_config,
         start_date=start_date,
         end_date=end_date,
@@ -3536,12 +3539,17 @@ def fetch_and_prepare_multi_stock_data_historical(
             print("-" * 70)
 
             config = replace(base_config, stock_no=symbol)
-            df = get_historical_trading_data(
-                config=config,
-                start_date=start_date,
-                end_date=end_date,
-                burn_in_months=burn_in_months,
-            )
+            if historical_price_data is None:
+                df = get_historical_trading_data(
+                    config=config,
+                    start_date=start_date,
+                    end_date=end_date,
+                    burn_in_months=burn_in_months,
+                )
+            else:
+                df = historical_price_data[
+                    historical_price_data["symbol"].astype(str) == str(symbol)
+                ].copy()
 
             if df is None or df.empty:
                 print(f"股票 {symbol} 無資料，略過。")
@@ -3596,6 +3604,14 @@ def fetch_and_prepare_multi_stock_data_historical(
     if "date" in combined_data.columns:
         combined_data["date"] = pd.to_datetime(combined_data["date"])
         combined_data = combined_data.sort_values(["date", "symbol"]).reset_index(drop=True)
+
+    if universe_membership is not None:
+        from pipeline_historical_universe import attach_daily_universe_membership
+
+        combined_data = attach_daily_universe_membership(
+            combined_data,
+            universe_membership,
+        )
 
     combined_data = add_low_subjective_targets(combined_data, horizon=base_config.horizon)
     combined_data = add_cross_sectional_pool_features(combined_data)

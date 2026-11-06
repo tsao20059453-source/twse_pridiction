@@ -342,6 +342,7 @@ TOP_TURNOVER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR = Path("data")
 RAW_DATA_DIR = DATA_DIR / "raw"
 RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+SHARED_RAW_CACHE_DIR: Optional[Path] = None
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -922,6 +923,19 @@ def set_reproducible_mode(pool_csv: Optional[str] = None, as_of: Optional[str] =
         print("=" * 70)
 
 
+def set_shared_raw_cache_dir(path: Optional[str] = None) -> None:
+    """Configure a read-only raw-data cache for reproducible replay runs."""
+    global SHARED_RAW_CACHE_DIR
+    if path is None:
+        SHARED_RAW_CACHE_DIR = None
+        return
+    cache_dir = Path(path).expanduser().resolve()
+    if not cache_dir.is_dir():
+        raise FileNotFoundError(f"共享原始快取目錄不存在：{cache_dir}")
+    SHARED_RAW_CACHE_DIR = cache_dir
+    print(f"[可重現模式] 使用唯讀共享原始快取：{SHARED_RAW_CACHE_DIR}")
+
+
 def get_reference_today() -> pd.Timestamp:
     """回傳程式視為「今天」的日期：可重現模式下為 --as-of，否則為系統日期。"""
     if REPRO_SETTINGS.get("as_of") is not None:
@@ -1175,7 +1189,13 @@ def clean_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_raw_cache_path(market: str, stock_no: str) -> Path:
-    return RAW_DATA_DIR / f"{market.upper()}_{stock_no}_raw.csv"
+    filename = f"{market.upper()}_{stock_no}_raw.csv"
+    local_path = RAW_DATA_DIR / filename
+    if is_offline_as_of_mode() and SHARED_RAW_CACHE_DIR is not None:
+        shared_path = SHARED_RAW_CACHE_DIR / filename
+        if shared_path.exists():
+            return shared_path
+    return local_path
 
 
 def read_raw_cache(cache_path: Path) -> pd.DataFrame:
@@ -1455,7 +1475,13 @@ def parse_market_index_date(value) -> pd.Timestamp:
 
 def get_market_index_cache_path(market: str) -> Path:
     index_symbol = "TAIEX" if market.upper() == "TWSE" else "MARKET_INDEX"
-    return RAW_DATA_DIR / f"{market.upper()}_{index_symbol}_raw.csv"
+    filename = f"{market.upper()}_{index_symbol}_raw.csv"
+    local_path = RAW_DATA_DIR / filename
+    if is_offline_as_of_mode() and SHARED_RAW_CACHE_DIR is not None:
+        shared_path = SHARED_RAW_CACHE_DIR / filename
+        if shared_path.exists():
+            return shared_path
+    return local_path
 
 
 def standardize_market_index_data(df: pd.DataFrame) -> pd.DataFrame:
