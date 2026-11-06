@@ -6,6 +6,7 @@ from pipeline_historical_universe import (
     append_unscored_execution_rows,
     build_daily_top_n_membership,
     load_daily_snapshot_prices,
+    schedule_oos_signals_for_next_open,
 )
 
 def aggregate_trades_by_entry(trade_log: pd.DataFrame) -> pd.DataFrame:
@@ -1494,12 +1495,19 @@ def run_backtest_mode(
     )
 
     if daily_top30_universe and not oos_df.empty and execution_source is not None:
-        oos_dates = pd.to_datetime(oos_df["date"], errors="coerce")
+        # D-close Top-N membership and model scores become executable only at
+        # the next trading day's open.  Rows without a score are preserved for
+        # stop-loss / take-profit handling after a stock leaves the Top-N pool.
+        scheduled_oos = schedule_oos_signals_for_next_open(oos_df, execution_source)
+        if scheduled_oos.empty:
+            print("每日 Top-N OOS 訊號沒有可用的下一交易日開盤價。")
+            return
+        print("每日 Top-N 回測執行方式：D 日收盤訊號，D+1 日開盤成交。")
         execution_dates = pd.to_datetime(execution_source["date"], errors="coerce")
         execution_source = execution_source.loc[
-            execution_dates.between(oos_dates.min(), oos_dates.max())
+            execution_dates.between(scheduled_oos["date"].min(), scheduled_oos["date"].max())
         ].copy()
-        oos_df = append_unscored_execution_rows(oos_df, execution_source)
+        oos_df = append_unscored_execution_rows(scheduled_oos, execution_source)
 
     if oos_df.empty:
         print("OOS 預測資料不足，無法執行回測。")

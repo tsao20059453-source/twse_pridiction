@@ -1299,6 +1299,20 @@ def run_portfolio_backtest(
         except (TypeError, ValueError):
             return default
 
+    def _entry_decision_close(row) -> float:
+        """Use the D-close price when a signal is scheduled for D+1 execution."""
+        signal_close = _f(row, "signal_close")
+        if pd.notna(signal_close) and signal_close > 0:
+            return signal_close
+        return _f(row, "close")
+
+    def _entry_execution_price(row) -> float:
+        """Return the executable price, defaulting to the legacy same-close fill."""
+        price = _f(row, "entry_execution_price")
+        if pd.notna(price) and price > 0:
+            return price
+        return _f(row, "close")
+
     def _new_daily_entry_diagnostics(date) -> dict:
         row = {"date": date}
         for key in ENTRY_DIAGNOSTIC_DAILY_COLUMNS:
@@ -1491,7 +1505,7 @@ def run_portfolio_backtest(
         market_filter_active: bool,
     ) -> tuple[dict[str, bool], dict[str, bool]]:
         _, score, _ = _entry_signal(row)
-        close = _f(row, "close")
+        close = _entry_decision_close(row)
         checks = _strong_continuation_base_checks(row, score, close)
         flags = {
             "rejected_strong_by_trend": not checks["trend_ok"],
@@ -1552,7 +1566,7 @@ def run_portfolio_backtest(
         _, score, _ = _entry_signal(row)
         zone_low  = _f(row, "support_entry_zone_low")
         zone_high = _f(row, "support_entry_zone_high")
-        close     = _f(row, "close")
+        close     = _entry_decision_close(row)
         entry_support_reason = _entry_support_reason(
             row=row,
             score=score,
@@ -1662,7 +1676,7 @@ def run_portfolio_backtest(
         _, score, _ = _entry_signal(row)
         zone_low  = _f(row, "support_entry_zone_low")
         zone_high = _f(row, "support_entry_zone_high")
-        close     = _f(row, "close")
+        close     = _entry_decision_close(row)
         support_reason = _entry_support_reason(
             row=row,
             score=score,
@@ -2385,7 +2399,8 @@ def run_portfolio_backtest(
 
                 zone_low  = _f(row, "support_entry_zone_low")
                 zone_high = _f(row, "support_entry_zone_high")
-                close     = _f(row, "close")
+                close     = _entry_decision_close(row)
+                execution_price = _entry_execution_price(row)
 
                 if not (override or score >= 0.55):
                     continue
@@ -2438,17 +2453,21 @@ def run_portfolio_backtest(
                 stop_loss_price = _f(row, "entry_stop_loss_price")
                 stop_loss_pct   = _f(row, "entry_stop_loss_pct")
 
-                if pd.isna(entry_rr_1) or entry_rr_1 < 1.5:
-                    continue
                 if pd.isna(stop_loss_price) or stop_loss_price <= 0:
                     continue
                 if pd.isna(stop_loss_pct) or stop_loss_pct < 0.012 or stop_loss_pct > 0.08:
                     continue
-                if pd.isna(close) or close <= 0:
+                if pd.isna(close) or close <= 0 or pd.isna(execution_price) or execution_price <= 0:
                     continue
 
                 tp1           = _f(row, "entry_take_profit_1")
                 tp2           = _f(row, "entry_take_profit_2")
+                if execution_price <= stop_loss_price or pd.isna(tp1) or tp1 <= execution_price:
+                    # A D+1 opening gap can invalidate a plan made at D close.
+                    continue
+                execution_rr_1 = (tp1 - execution_price) / (execution_price - stop_loss_price)
+                if pd.isna(entry_rr_1) or entry_rr_1 < 1.5 or execution_rr_1 < 1.5:
+                    continue
                 atr_val       = _f(row, "atr_14", 0.0)
                 support_level = _f(row, "nearest_support_level")
 
@@ -2484,12 +2503,12 @@ def run_portfolio_backtest(
                     filtered_entries_count += 1
                     continue
 
-                shares = position_value / close
+                shares = position_value / execution_price
                 cash  -= position_value
 
                 entry_counter += 1
                 entry_date_str = pd.Timestamp(current_date).strftime("%Y-%m-%d")
-                trade_id = f"{sym}_{entry_date_str}_{round(float(close), 4)}"
+                trade_id = f"{sym}_{entry_date_str}_{round(float(execution_price), 4)}"
                 _is_re_entry = sym in profit_exited_symbols
                 if _is_re_entry:
                     re_entry_count += 1
@@ -2529,7 +2548,7 @@ def run_portfolio_backtest(
                     "phase1_done":                        False,
                     "phase2_done":                        False,
                     "stop_loss":                          stop_loss_price,
-                    "max_close":                          close,
+                    "max_close":                          _f(row, "close", execution_price),
                     "holding_days":                       0,
                     "atr_at_entry":                       atr_val,
                     "support_entry_zone_low":             zone_low,
@@ -2569,7 +2588,7 @@ def run_portfolio_backtest(
                     "re_entry_after_profit":               _is_re_entry,
                 }
                 _add_layer(pos, layer_id=1, entry_date=current_date,
-                           entry_price=close, shares=shares, cost=position_value)
+                           entry_price=execution_price, shares=shares, cost=position_value)
 
                 positions.append(pos)
                 _bump_entry_diagnostic(daily_entry_diag, "executed_entries")

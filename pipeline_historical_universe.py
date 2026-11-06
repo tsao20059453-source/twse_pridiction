@@ -343,3 +343,73 @@ def append_unscored_execution_rows(oos_frame: pd.DataFrame, source_frame: pd.Dat
         .sort_values(["date", "symbol"])
         .reset_index(drop=True)
     )
+
+
+def schedule_oos_signals_for_next_open(
+    oos_frame: pd.DataFrame,
+    source_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Move D-close model signals to the next trading day's opening execution.
+
+    ``oos_frame`` remains the D-date model output: all scores, indicators and
+    risk plans are calculated only from information available at D close.  The
+    returned rows use D+1 OHLC for portfolio valuation and exit handling while
+    retaining ``signal_close`` and the D-date technical fields for the entry
+    decision.  The final D-date signal is dropped when no following trading
+    day exists in ``source_frame``.
+    """
+    if oos_frame is None or oos_frame.empty:
+        return pd.DataFrame()
+    if source_frame is None or source_frame.empty:
+        raise ValueError("next-open scheduling requires execution source OHLC data")
+
+    signals = oos_frame.copy()
+    signals["date"] = pd.to_datetime(signals["date"], errors="coerce").dt.normalize()
+    signals["symbol"] = signals["symbol"].astype(str)
+    signals = signals.dropna(subset=["date", "symbol"]).copy()
+
+    source = source_frame.copy()
+    source["date"] = pd.to_datetime(source["date"], errors="coerce").dt.normalize()
+    source["symbol"] = source["symbol"].astype(str)
+    source = source.dropna(subset=["date", "symbol"]).copy()
+    source = source.drop_duplicates(["date", "symbol"], keep="last")
+    calendar = pd.DatetimeIndex(sorted(source["date"].dropna().unique()))
+    if len(calendar) < 2:
+        raise ValueError("next-open scheduling requires at least two trading dates")
+    next_date = dict(zip(calendar[:-1], calendar[1:]))
+
+    signals["signal_date"] = signals["date"]
+    signals["date"] = signals["signal_date"].map(next_date)
+    signals = signals.dropna(subset=["date"]).copy()
+    if signals.empty:
+        return signals
+
+    signals["signal_close"] = pd.to_numeric(signals.get("close"), errors="coerce")
+    execution_cols = ["date", "symbol", "open", "high", "low", "close"]
+    execution = source[[c for c in execution_cols if c in source.columns]].copy()
+    execution = execution.rename(columns={
+        "open": "execution_open",
+        "high": "execution_high",
+        "low": "execution_low",
+        "close": "execution_close",
+    })
+    scheduled = signals.merge(execution, on=["date", "symbol"], how="left")
+    required = ["execution_open", "execution_high", "execution_low", "execution_close"]
+    missing = [column for column in required if column not in scheduled.columns]
+    if missing:
+        raise ValueError(f"execution source missing OHLC columns: {missing}")
+    for column in required:
+        scheduled[column] = pd.to_numeric(scheduled[column], errors="coerce")
+    scheduled = scheduled.dropna(subset=required).copy()
+    scheduled = scheduled[
+        scheduled[required].gt(0).all(axis=1)
+    ].copy()
+
+    # D+1 OHLC drives execution, intraday stops, and daily mark-to-market.
+    scheduled["open"] = scheduled["execution_open"]
+    scheduled["high"] = scheduled["execution_high"]
+    scheduled["low"] = scheduled["execution_low"]
+    scheduled["close"] = scheduled["execution_close"]
+    scheduled["entry_execution_price"] = scheduled["execution_open"]
+    scheduled["entry_execution_timing"] = "next_open"
+    return scheduled.sort_values(["date", "symbol"]).reset_index(drop=True)
