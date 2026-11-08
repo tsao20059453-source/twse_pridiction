@@ -3523,6 +3523,16 @@ def fetch_and_prepare_multi_stock_data_historical(
         end_date=end_date,
         burn_in_months=burn_in_months,
     )
+    snapshot_by_symbol: dict[str, pd.DataFrame] = {}
+    if historical_price_data is not None and not historical_price_data.empty:
+        # Daily Top-N's union can contain hundreds of symbols. Group once so
+        # each per-symbol feature pass does not scan and cast the full table.
+        snapshot_source = historical_price_data.copy()
+        snapshot_source["symbol"] = snapshot_source["symbol"].astype(str)
+        snapshot_by_symbol = {
+            str(symbol): group.copy()
+            for symbol, group in snapshot_source.groupby("symbol", sort=False)
+        }
 
     for symbol in symbols:
         try:
@@ -3547,9 +3557,7 @@ def fetch_and_prepare_multi_stock_data_historical(
                     burn_in_months=burn_in_months,
                 )
             else:
-                df = historical_price_data[
-                    historical_price_data["symbol"].astype(str) == str(symbol)
-                ].copy()
+                df = snapshot_by_symbol.get(str(symbol), pd.DataFrame()).copy()
                 # Daily Top-N snapshots are already point-in-time filtered,
                 # so they bypass get_historical_trading_data(). Apply the
                 # same corporate-action adjustment before feature creation.

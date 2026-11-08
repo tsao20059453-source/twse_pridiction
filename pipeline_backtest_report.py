@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import pickle
+from pathlib import Path
+
 from pipeline_model_output import *
 from pipeline_backtest_engine import *
 from pipeline_historical_universe import (
@@ -8,7 +13,36 @@ from pipeline_historical_universe import (
     load_daily_snapshot_prices,
     schedule_oos_signals_for_next_open,
 )
-from pipeline_weight_optimization import run_score_weight_optimization
+from pipeline_weight_optimization import SCORE_COLUMNS, run_score_weight_optimization
+
+
+DAILY_TOP_N_OOS_CACHE_VERSION = 1
+
+
+def _daily_top_n_oos_cache_path(
+    config: PipelineConfig,
+    *,
+    top_n: int,
+    rank_metric: str,
+    end_date: pd.Timestamp,
+) -> Path:
+    """Return a configuration-specific OOS cache path for score optimization."""
+    settings = {
+        "version": DAILY_TOP_N_OOS_CACHE_VERSION,
+        "end_date": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
+        "years": int(config.years),
+        "top_n": int(top_n),
+        "rank_metric": str(rank_metric),
+        "horizon": int(config.horizon),
+        "feature_set": str(config.feature_set),
+        "model_type": str(config.model_type),
+        "model_profile": str(config.model_profile),
+        "target_col": str(config.target_col),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(settings, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return Path(config.output_dir) / "cache" / f"daily_top_n_oos_v{DAILY_TOP_N_OOS_CACHE_VERSION}_{fingerprint}.pkl"
 
 def aggregate_trades_by_entry(trade_log: pd.DataFrame) -> pd.DataFrame:
     """
@@ -1447,7 +1481,9 @@ def run_backtest_mode(
             trading_dates=trading_dates,
             top_n=top_n,
             rank_metric=daily_top30_rank_metric,
-            sleep_sec=0,
+            # A zero-delay historical download quickly triggers TWSE's WAF.
+            # Cached dates remain immediate; only missing snapshots are paced.
+            sleep_sec=shared_config.sleep_sec,
         )
         symbols = sorted(universe_membership["symbol"].astype(str).unique().tolist())
         stock_list = pd.DataFrame({"symbol": symbols})
@@ -1462,6 +1498,39 @@ def run_backtest_mode(
             target_symbol=target_symbol,
             quiet=True,
         )
+
+    oos_cache_path: Path | None = None
+    if daily_top30_universe and optimize_score_weights:
+        oos_cache_path = _daily_top_n_oos_cache_path(
+            shared_config,
+            top_n=top_n,
+            rank_metric=daily_top30_rank_metric,
+            end_date=end_date,
+        )
+        if oos_cache_path.exists():
+            try:
+                cached_oos = pd.read_pickle(oos_cache_path)
+                required_columns = {"date", "symbol", "oos_fold", *SCORE_COLUMNS}
+                if required_columns.issubset(cached_oos.columns) and not cached_oos.empty:
+                    print(f"[OOS CACHE HIT] 使用已保存的 OOS 表：{oos_cache_path}")
+                    run_score_weight_optimization(
+                        oos_df=cached_oos,
+                        config=config,
+                        market_df=market_df,
+                        tuning_folds=optimization_tuning_folds,
+                        maxiter=optimization_maxiter,
+                        popsize=optimization_popsize,
+                        regularization=optimization_regularization,
+                        min_total_trades=optimization_min_trades,
+                        ai_range_audit=optimization_ai_range_audit,
+                        max_weight=optimization_max_weight,
+                        entry_threshold_min=optimization_entry_threshold_min,
+                        entry_threshold_max=optimization_entry_threshold_max,
+                    )
+                    return
+                print(f"[OOS CACHE] 欄位不完整，忽略快取：{oos_cache_path}")
+            except (OSError, ValueError, EOFError, pickle.UnpicklingError) as exc:
+                print(f"[OOS CACHE] 讀取失敗，重新建立：{exc}")
 
     print(f"Step 1/3: 抓取 {len(symbols)} 支股票的歷史資料...")
     if not investor_mode:
@@ -1479,7 +1548,7 @@ def run_backtest_mode(
             snapshot_prices = load_daily_snapshot_prices(
                 trading_dates=trading_dates,
                 symbols=symbols,
-                sleep_sec=0,
+                sleep_sec=shared_config.sleep_sec,
             )
             combined_data = fetch_and_prepare_multi_stock_data_historical(
                 symbols=symbols,
@@ -1523,6 +1592,11 @@ def run_backtest_mode(
     if oos_df.empty:
         print("OOS 預測資料不足，無法執行回測。")
         return
+
+    if daily_top30_universe and optimize_score_weights and oos_cache_path is not None:
+        oos_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        oos_df.to_pickle(oos_cache_path)
+        print(f"[OOS CACHE WRITE] 已保存 OOS 表：{oos_cache_path}")
 
     if optimize_score_weights:
         if not daily_top30_universe:
