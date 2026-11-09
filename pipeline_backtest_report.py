@@ -44,6 +44,27 @@ def _daily_top_n_oos_cache_path(
     ).hexdigest()[:16]
     return Path(config.output_dir) / "cache" / f"daily_top_n_oos_v{DAILY_TOP_N_OOS_CACHE_VERSION}_{fingerprint}.pkl"
 
+
+def _limit_oos_evaluation_end(
+    oos_df: pd.DataFrame,
+    evaluation_end_date: Optional[str],
+) -> pd.DataFrame:
+    """Limit optimization evaluation rows without changing cached OOS predictions."""
+    if evaluation_end_date is None:
+        return oos_df
+    cutoff = pd.Timestamp(evaluation_end_date).normalize()
+    dates = pd.to_datetime(oos_df["date"], errors="coerce")
+    limited = oos_df.loc[dates.le(cutoff)].copy()
+    if limited.empty:
+        raise ValueError(
+            f"optimization_evaluation_end_date={cutoff:%Y-%m-%d} removes all OOS rows"
+        )
+    print(
+        f"[OOS EVALUATION CUTOFF] 僅評估至 {cutoff:%Y-%m-%d}："
+        f"{len(oos_df):,} -> {len(limited):,} 列。"
+    )
+    return limited
+
 def aggregate_trades_by_entry(trade_log: pd.DataFrame) -> pd.DataFrame:
     """
     以 trade_id（單次進場）為單位，把同一次進場的所有出場記錄（含分批出場）
@@ -1445,6 +1466,7 @@ def run_backtest_mode(
     optimization_max_weight: float = 0.60,
     optimization_entry_threshold_min: float = 0.50,
     optimization_entry_threshold_max: float = 0.80,
+    optimization_evaluation_end_date: Optional[str] = None,
 ) -> None:
     """
     Top-level coordinator for Mode 3 backtest analysis.
@@ -1513,6 +1535,9 @@ def run_backtest_mode(
                 required_columns = {"date", "symbol", "oos_fold", *SCORE_COLUMNS}
                 if required_columns.issubset(cached_oos.columns) and not cached_oos.empty:
                     print(f"[OOS CACHE HIT] 使用已保存的 OOS 表：{oos_cache_path}")
+                    cached_oos = _limit_oos_evaluation_end(
+                        cached_oos, optimization_evaluation_end_date
+                    )
                     run_score_weight_optimization(
                         oos_df=cached_oos,
                         config=config,
@@ -1601,6 +1626,7 @@ def run_backtest_mode(
     if optimize_score_weights:
         if not daily_top30_universe:
             raise ValueError("權重最佳化目前只支援 --daily-top30-universe 的 point-in-time 回測。")
+        oos_df = _limit_oos_evaluation_end(oos_df, optimization_evaluation_end_date)
         run_score_weight_optimization(
             oos_df=oos_df,
             config=config,

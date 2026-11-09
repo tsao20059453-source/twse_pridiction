@@ -365,6 +365,11 @@ def main() -> None:
     parser.add_argument("--optimization-entry-threshold-max", type=float, default=0.80,
                         help="DE 搜尋的進場門檻上界。")
     parser.add_argument(
+        "--optimization-evaluation-end-date",
+        default=None,
+        help="DE 最終評估 OOS 的截止日 YYYY-MM-DD；只截斷評估列，不重建快取或模型。",
+    )
+    parser.add_argument(
         "--include-otc",
         action="store_true",
         help="股票池納入上櫃股票：上市＋上櫃合併依當日成交金額取前 N 檔（個股分析會自動判別上市／上櫃，不需此參數）",
@@ -667,6 +672,7 @@ def main() -> None:
             optimization_max_weight=args.optimization_max_weight,
             optimization_entry_threshold_min=args.optimization_entry_threshold_min,
             optimization_entry_threshold_max=args.optimization_entry_threshold_max,
+            optimization_evaluation_end_date=args.optimization_evaluation_end_date,
         )
         return
 

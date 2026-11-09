@@ -9,7 +9,7 @@ remain owned by the normal backtest engine.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 import json
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -297,19 +297,33 @@ class WalkForwardWeightEvaluator:
         ), fold_metrics
 
 
-def _optimize_de(evaluator: WalkForwardWeightEvaluator, config: OptimizationConfig) -> tuple[DecisionParameters, EvaluationSummary, list[FoldMetrics]]:
+def _optimize_de(
+    evaluator: WalkForwardWeightEvaluator,
+    config: OptimizationConfig,
+    *,
+    generation_checkpoint_path: Path | None = None,
+    checkpoint_context: dict | None = None,
+) -> tuple[DecisionParameters, EvaluationSummary, list[FoldMetrics]]:
     try:
         from scipy.optimize import differential_evolution
     except ImportError as exc:
         raise RuntimeError("scipy is required for Differential Evolution optimization") from exc
 
     generation = 0
+    best_seen: dict[str, object] = {}
 
     def objective(vector: np.ndarray) -> float:
         try:
             parameters = normalize_parameters(vector[:4], float(vector[4]), config)
-            summary, _ = evaluator.evaluate(parameters)
-            return -summary.objective if summary.feasible else 1e6
+            summary, metrics = evaluator.evaluate(parameters)
+            if summary.feasible:
+                previous = best_seen.get("summary")
+                if previous is None or summary.objective > previous.objective:
+                    best_seen["parameters"] = parameters
+                    best_seen["summary"] = summary
+                    best_seen["metrics"] = metrics
+                return -summary.objective
+            return 1e6
         except (ValueError, FloatingPointError):
             return 1e6
 
@@ -317,6 +331,24 @@ def _optimize_de(evaluator: WalkForwardWeightEvaluator, config: OptimizationConf
         nonlocal generation
         generation += 1
         print(f"DE generation {generation}/{config.maxiter}, convergence={convergence:.6f}", flush=True)
+        if generation_checkpoint_path is not None:
+            checkpoint = dict(checkpoint_context or {})
+            checkpoint.update({
+                "status": "de_search_in_progress",
+                "generation": generation,
+                "maxiter": config.maxiter,
+                "convergence": float(convergence),
+            })
+            parameters = best_seen.get("parameters")
+            summary = best_seen.get("summary")
+            metrics = best_seen.get("metrics")
+            if isinstance(parameters, DecisionParameters):
+                checkpoint["optimized_parameters"] = parameters.as_dict()
+            if isinstance(summary, EvaluationSummary):
+                checkpoint["tuning_summary"] = summary.as_dict()
+            if isinstance(metrics, list):
+                checkpoint["tuning_fold_metrics"] = [item.as_dict() for item in metrics]
+            _write_json(generation_checkpoint_path, checkpoint)
         return False
 
     result = differential_evolution(
@@ -338,11 +370,31 @@ def _optimize_de(evaluator: WalkForwardWeightEvaluator, config: OptimizationConf
 
 
 def _serialize(value):
-    if isinstance(value, (np.floating, np.integer)):
+    if isinstance(value, (np.floating, np.integer, np.bool_)):
         return value.item()
-    if isinstance(value, pd.Timestamp):
+    if isinstance(value, (pd.Timestamp, datetime, date)):
         return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if value is pd.NA:
+        return None
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, pd.DataFrame):
+        return value.to_dict(orient="records")
+    if isinstance(value, pd.Series):
+        return value.tolist()
     raise TypeError(f"cannot serialize {type(value)!r}")
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    """Atomically persist an optimization checkpoint or final summary."""
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=_serialize),
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
 
 
 def write_claude_search_range_audit(
@@ -484,11 +536,39 @@ def run_score_weight_optimization(
         objective_config=objective_config,
         target_weights=baseline.weights,
     )
+    output_dir = Path(config.output_dir) / "optimization"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = output_dir / f"de_score_weights_{timestamp}"
+    checkpoint_path = Path(f"{prefix}_checkpoint.json")
+    checkpoint_context = {
+        "method": "differential_evolution",
+        "score_profile_baseline": profile["profile"],
+        "tuning_folds": tune,
+        "outer_folds": outer,
+        "objective_config": asdict(objective_config),
+        "baseline_parameters": baseline.as_dict(),
+    }
     print(
         f"權重最佳化：前 {len(tune)} folds 調參（{tune}），"
         f"後 {len(outer)} folds 保留測試（{outer}）。"
     )
-    best, best_summary, tuning_metrics = _optimize_de(evaluator, objective_config)
+    best, best_summary, tuning_metrics = _optimize_de(
+        evaluator,
+        objective_config,
+        generation_checkpoint_path=checkpoint_path,
+        checkpoint_context=checkpoint_context,
+    )
+
+    checkpoint = {
+        **checkpoint_context,
+        "status": "de_completed_outer_pending",
+        "optimized_parameters": best.as_dict(),
+        "tuning_summary": best_summary.as_dict(),
+        "tuning_fold_metrics": [item.as_dict() for item in tuning_metrics],
+    }
+    _write_json(checkpoint_path, checkpoint)
+    print(f"DE checkpoint 已輸出：{checkpoint_path}")
 
     outer_data = select_fold_period(oos_df, outer)
     optimized_outer = apply_decision_parameters(outer_data, best)
@@ -506,10 +586,6 @@ def run_score_weight_optimization(
         investor_mode=True, save_snapshot=False,
     )
 
-    output_dir = Path(config.output_dir) / "optimization"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    prefix = output_dir / f"de_score_weights_{timestamp}"
     tuning_table = pd.DataFrame([item.as_dict() for item in tuning_metrics])
     tuning_table.to_csv(f"{prefix}_tuning_folds.csv", index=False, encoding="utf-8-sig")
     optimized_equity.to_csv(f"{prefix}_optimized_outer_equity.csv", index=False, encoding="utf-8-sig")
@@ -517,6 +593,7 @@ def run_score_weight_optimization(
     baseline_equity.to_csv(f"{prefix}_baseline_outer_equity.csv", index=False, encoding="utf-8-sig")
     baseline_trades.to_csv(f"{prefix}_baseline_outer_trades.csv", index=False, encoding="utf-8-sig")
     result = {
+        "status": "complete",
         "method": "differential_evolution",
         "score_profile_baseline": profile["profile"],
         "tuning_folds": tune,
@@ -551,8 +628,8 @@ def run_score_weight_optimization(
         except Exception as exc:
             result["claude_search_range_audit_error"] = str(exc)
             print(f"Claude 搜尋範圍建議失敗（不影響 DE 結果）：{exc}")
-    summary_path = f"{prefix}_summary.json"
-    Path(summary_path).write_text(json.dumps(result, ensure_ascii=False, indent=2, default=_serialize), encoding="utf-8")
+    summary_path = Path(f"{prefix}_summary.json")
+    _write_json(summary_path, result)
     print(f"DE 最佳參數：{best.as_dict()}")
     print(f"調參目標值：{best_summary.objective:.6f}")
     print(f"保留 OOS baseline 績效：{baseline_metrics}")
